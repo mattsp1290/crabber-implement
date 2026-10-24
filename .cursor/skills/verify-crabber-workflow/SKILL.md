@@ -21,7 +21,7 @@ Every completed workflow has implemented the plan and received a fresh approval 
 
 The checker is `crabber-workflow-checker-v1` in `src/formal_verification.rs`. The covered product code is `src/workflow.rs`, specifically `document` and `occurrence_allowed`. Read the handler's `execute` and `review` methods when changing either function to confirm their outcome labels still mean what the checker models.
 
-The synchronization commit is `0cb3f9ac46104d789e4234d8c594d773483542cf`. The React monitor update changes artifact publication around execution, while `document` and `occurrence_allowed` remain unchanged. The passing `.audit/formal/result.json` records the covered source hashes and tool versions. Recheck the model and advance this commit when covered execution behavior changes.
+The synchronization commit is `136f0d6e24d11ba62df16814d1cb37d4dbef228e`. The completion-handling update changes internal stage execution and blocker diagnostics, while `document` and `occurrence_allowed` remain unchanged. The passing `.audit/formal/result.json` records the covered source hashes and tool versions. Recheck the model and advance this commit when covered execution behavior changes.
 
 ## Tool and scope
 
@@ -32,6 +32,7 @@ The checker covers every integer review budget from 1 through 100, matching the 
 This is a bounded control-flow proof under these assumptions:
 
 - Work tasks settle with one declared label or a permanent error. Their internal tool execution is one abstract action.
+- Same-session empty-answer continuations remain inside that abstract work action. The CLI regression suite checks their shared turn/deadline limits; this graph model does not prove those limits.
 - `implemented` means the runtime has accepted the implementation checkpoint. `approved` means the host has accepted both reviewer reports. Report honesty and plan completeness are outside this model.
 - The runtime calls `occurrence_allowed` before each work session. The checker tests that predicate, while its placement in the handler remains a source-review obligation.
 - Work-task retries stay disabled. The checker rejects a compiled work task whose maximum attempts differs from one. It does not model lease loss, process crashes, cancellation races or concurrent external Git writes.

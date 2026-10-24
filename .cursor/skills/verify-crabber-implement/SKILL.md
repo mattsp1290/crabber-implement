@@ -48,6 +48,8 @@ This helper creates a disposable Git repository and a plan. It runs the actual e
 
 For a turn-limit regression, run the focused [model turn budget journey](features/turn-budget.md). It exercises more than 64 model requests through the actual executable and verifies explicit-budget failure. It uses no live provider credential.
 
+For premature completion or retry changes, run the [model completion journey](features/completion.md). It checks bounded continuations, shared budgets, rejected truncated tools, preserved post-compaction prompts, and final-answer isolation from failed attempts.
+
 For the React monitor, run the [Docker and Playwright journey](features/monitor.md). It launches the production monitor in Docker, drives real artifact updates through a browser, and observes the actual CLI before and after a paused model response. No provider credential is needed.
 
 ## Evidence

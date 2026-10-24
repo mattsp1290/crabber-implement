@@ -5,3 +5,4 @@
 - [Failure handling](failures.md) covers invalid reports, exhausted review budgets, and invalid inputs.
 - [Model turn budget](turn-budget.md) covers long implementations, explicit caps, and session evidence.
 - [Live React monitor](monitor.md) covers current nodes, agent output, review loops, archived runs, stale heartbeats, errors, and Docker browser verification.
+- [Model completion recovery](completion.md) covers empty final answers, shared budgets, truncation, and safe failure diagnostics.

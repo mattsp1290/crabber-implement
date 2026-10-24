@@ -16,6 +16,7 @@ args = parser.parse_args()
 evidence = (ROOT / args.evidence).resolve()
 evidence.mkdir(parents=True, exist_ok=True)
 web = ROOT / 'web'
+(web / 'node_modules').mkdir(exist_ok=True)
 image = 'crabber-monitor:verify'
 browser_image = 'mcr.microsoft.com/playwright:v1.64.1-noble'
 

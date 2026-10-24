@@ -13,7 +13,7 @@ Keep these checkouts beside each other:
 ~/git/dmt-flows
 ```
 
-The Crabber checkout must include the public `AgentBuilder::max_turns` API.
+The Crabber checkout must include the public `AgentBuilder::max_turns` API and model completion metadata. Update the sibling checkout when building after a completion-handling change.
 
 Build the binary:
 
@@ -71,7 +71,12 @@ Its default is `https://opencode.ai/zen/go/v1`.
 A model turn includes one model response and its tool batch. The final answer also consumes a turn.
 Provider retries and compaction do not add outer turns.
 The turn budget and `--session-timeout` apply independently.
-Reaching either limit stops the workflow and preserves partial edits. The program does not restart the task automatically.
+Both limits cover the entire stage session, including any continuations after an empty model answer.
+Reaching either limit stops the workflow and preserves partial edits. The program does not restart the workflow automatically.
+
+If a model ends without visible final text, the host can ask it to continue in the same conversation up to two times. Each continuation gets only the remaining turn allowance and shares the original deadline. It continues from the current repository state and conversation history.
+
+The provider finish reason distinguishes a normal response from output truncation or filtering. Truncated tool calls are rejected before execution. A truncated response without tool calls can use the same bounded continuation allowance. Filtered responses, other provider failures, cancellation, and exhausted budgets stop the stage. An explicit `BLOCKED` report retains the agent's explanation in the error.
 
 The review budget includes the first review. Exhausting it returns a nonzero exit code and preserves findings.
 `NEEDS_DISCUSSION`, malformed reports, agent failures, and fixes marked `needs-manual` also stop the run.
@@ -114,6 +119,7 @@ They include the plan, graph document, session text, tool result logs, stage eve
 Each session also writes `<stage>.session.json` on success or failure after the session starts.
 It records the workflow run ID, Crabber session and run IDs, configured turn budget, observed model-turn count, status, and error.
 These records contain no provider credentials.
+They also record individual continuation runs, cumulative turn counts, finish reasons, and token usage. Session JSON keeps a bounded tail of response summaries. `<stage>.responses.jsonl` retains every completed-response record. Private model reasoning is not copied into these diagnostics. A provider request ending successfully does not by itself mean that implementation completed.
 The CLI writes diagnostics locally and does not configure a Datadog exporter.
 
 Review reports live at `reviews/<run-id>-<round>/` in the target repository.
@@ -165,7 +171,7 @@ python3 scripts/verify_web.py
 The Docker journey needs Docker, Node, Cargo, and the sibling Rust checkouts. It uses a local model protocol fixture and no provider key. Playwright checks artifact updates and the real CLI while an implementation session is paused, then verifies completion. Screenshots, browser traces, CLI output, and exported artifacts survive container and fixture cleanup under `.audit/web/`. The browser image is pinned to the installed Playwright version.
 
 `tests/cli.rs` drives the actual binary against a local chat-completions fixture.
-It checks file mutation, local commits, the review-fix-review cycle, malformed review rejection, input failures, and model-turn limits beyond 64 requests.
+It checks file mutation, local commits, the review-fix-review cycle, malformed review rejection, input failures, model-turn limits beyond 64 requests, and bounded recovery from empty or truncated answers.
 The fixture replaces the external model boundary. It uses the real Crabber tools and DMT engine.
 
 The project-local verification skills document the live model journey and the bounded workflow check.
