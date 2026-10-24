@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 fn git(repo: &Path, args: &[&str]) -> String {
@@ -56,6 +56,7 @@ struct Fixture {
     address: String,
     stop: Arc<AtomicBool>,
     implementation_requests: Arc<AtomicUsize>,
+    stream_release: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -68,6 +69,8 @@ impl Fixture {
         let stopped = stop.clone();
         let implementation_requests = Arc::new(AtomicUsize::new(0));
         let requests = implementation_requests.clone();
+        let stream_release = Arc::new(AtomicBool::new(false));
+        let release = stream_release.clone();
         let repo = repo.to_path_buf();
         let worker = thread::spawn(move || {
             let mut connections = Vec::new();
@@ -76,6 +79,8 @@ impl Fixture {
                     Ok((mut stream, _)) => {
                         let repo = repo.clone();
                         let requests = requests.clone();
+                        let release = release.clone();
+                        let stopped = stopped.clone();
                         connections.push(thread::spawn(move || {
                         stream.set_nonblocking(false).unwrap();
                         stream
@@ -135,6 +140,21 @@ impl Fixture {
                                 json!({"path":"hello.txt","content":"initial\n"}),
                             )
                         };
+                        if has_result && serialized.contains("LIVE_ARTIFACTS")
+                            && !serialized.contains("Perform your assigned independent review")
+                            && !serialized.contains("Execute the following fix-review skill") {
+                            let first = format!("data: {}\n\n", json!({"choices":[{"index":0,"delta":{"content":"Implemented live "},"finish_reason":null}]}));
+                            let last = format!("data: {}\n\ndata: [DONE]\n\n", text("artifacts and verified hello.txt."));
+                            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", first.len() + last.len(), first).unwrap();
+                            stream.flush().unwrap();
+                            while !release.load(Ordering::Relaxed) && !stopped.load(Ordering::Relaxed) {
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                            if !stopped.load(Ordering::Relaxed) {
+                                stream.write_all(last.as_bytes()).unwrap();
+                            }
+                            return;
+                        }
                         let payload = format!("data: {}\n\ndata: [DONE]\n\n", response);
                         write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload).unwrap();
                         }));
@@ -153,6 +173,7 @@ impl Fixture {
             address,
             stop,
             implementation_requests,
+            stream_release,
             worker: Some(worker),
         }
     }
@@ -465,6 +486,165 @@ fn session_evidence(repo: &Path) -> Value {
         &std::fs::read(run_artifacts(repo).join("implement.session.json")).unwrap(),
     )
     .unwrap()
+}
+
+fn wait_until(mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for live artifacts"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn export_artifacts(artifacts: &Path, phase: &str) {
+    let Some(destination) = std::env::var_os("CRABBER_VERIFY_ARTIFACTS") else {
+        return;
+    };
+    let root = Path::new(&destination);
+    let run_id = artifacts.file_name().unwrap();
+    let snapshot = root.join(phase).join(run_id);
+    std::fs::create_dir_all(&snapshot).unwrap();
+    for entry in std::fs::read_dir(artifacts).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file()
+            && !entry.file_name().to_string_lossy().ends_with(".tmp")
+        {
+            std::fs::copy(entry.path(), snapshot.join(entry.file_name())).unwrap();
+        }
+    }
+    let temporary = root.join("snapshot.json.tmp");
+    std::fs::write(
+        &temporary,
+        json!({"run_id":run_id.to_str().unwrap(),"artifacts":artifacts,"phase":phase}).to_string(),
+    )
+    .unwrap();
+    std::fs::rename(temporary, root.join("snapshot.json")).unwrap();
+}
+
+#[test]
+fn cli_streams_live_artifacts_before_completion() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let plan = tempfile::NamedTempFile::with_suffix(".md").unwrap();
+    std::fs::write(plan.path(), "LIVE_ARTIFACTS Create hello.txt.").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+        .arg(plan.path())
+        .arg("--repo")
+        .arg(repo.path())
+        .arg("--skills-dir")
+        .arg(repo.path().join(".git/fixture-skills"))
+        .arg("--base-url")
+        .arg(format!("http://{}", fixture.address))
+        .arg("--session-timeout")
+        .arg("180")
+        .env("OPENCODE_GO_API_KEY", "fixture-key")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until(|| {
+        repo.path()
+            .join(".git/crabber-implement")
+            .read_dir()
+            .is_ok_and(|mut entries| entries.next().is_some())
+    });
+    let artifacts = run_artifacts(repo.path());
+    wait_until(|| {
+        std::fs::read_to_string(artifacts.join("implement.txt"))
+            .is_ok_and(|text| text == "Implemented live ")
+    });
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "CLI exited before stream completed"
+    );
+    assert!(!artifacts.join("result.json").exists());
+    let evidence = session_evidence(repo.path());
+    assert_eq!(evidence["status"], "running");
+    assert_eq!(evidence["name"], "implement");
+    assert!(evidence["observed_turns"].as_u64().unwrap() > 0);
+    assert!(!evidence["session_id"].as_str().unwrap().is_empty());
+    let tool_log = std::fs::read_to_string(artifacts.join("implement.tools.txt")).unwrap();
+    assert!(
+        !tool_log.trim().is_empty(),
+        "tool results must be visible during a session"
+    );
+    for line in tool_log.lines() {
+        serde_json::from_str::<Value>(line).unwrap();
+    }
+    let read_metadata = || {
+        serde_json::from_slice::<Value>(&std::fs::read(artifacts.join("run.json")).unwrap())
+            .unwrap()
+    };
+    let metadata = read_metadata();
+    assert_eq!(metadata["version"], 1);
+    assert_eq!(
+        metadata["run_id"],
+        artifacts.file_name().unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        metadata["repo"],
+        repo.path().canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        metadata["branch"],
+        git(repo.path(), &["branch", "--show-current"]).trim()
+    );
+    assert_eq!(metadata["model"], "glm-5.2");
+    let first_heartbeat = metadata["heartbeat_at_ms"].as_u64().unwrap();
+    wait_until(|| read_metadata()["heartbeat_at_ms"].as_u64().unwrap() > first_heartbeat);
+    export_artifacts(&artifacts, "live");
+    if let Some(hold_file) = std::env::var_os("CRABBER_VERIFY_HOLD_FILE") {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !Path::new(&hold_file).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for browser verification release"
+            );
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "CLI exited during browser verification"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    fixture.stream_release.store(true, Ordering::Relaxed);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout {}\nstderr {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(artifacts.join("implement.txt")).unwrap(),
+        "Implemented live artifacts and verified hello.txt."
+    );
+    assert_eq!(session_evidence(repo.path())["status"], "completed");
+    let result: Value =
+        serde_json::from_slice(&std::fs::read(artifacts.join("result.json")).unwrap()).unwrap();
+    assert_eq!(result["status"], "completed");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("review 2"));
+    let final_heartbeat = read_metadata()["heartbeat_at_ms"].as_u64().unwrap();
+    thread::sleep(Duration::from_millis(1100));
+    assert_eq!(
+        read_metadata()["heartbeat_at_ms"].as_u64().unwrap(),
+        final_heartbeat,
+        "heartbeat continued after the workflow exited"
+    );
+    export_artifacts(&artifacts, "completed");
+    if let Some(done_file) = std::env::var_os("CRABBER_VERIFY_DONE_FILE") {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !Path::new(&done_file).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for completed browser verification"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 #[test]

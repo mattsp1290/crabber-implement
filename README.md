@@ -79,9 +79,38 @@ Control-C interrupts the active agents and preserves their artifacts.
 
 ## Inspect the result
 
+### Watch a run in the React app
+
+Build the CLI after pulling these changes. Run your plan with the existing command, then start the monitor in another terminal.
+
+```sh
+cd ~/git/crabber-implement/web
+npm ci
+npm run build
+ARTIFACTS_DIR="$(git -C /path/to/target/repository rev-parse --absolute-git-dir)/crabber-implement" npm start
+```
+
+Open `http://127.0.0.1:4173`. Select a run to see its current workflow node, agent text, tool results, and stage history. Both independent reviewers appear as separate sessions. Selecting a node or session lets you inspect earlier work while execution continues. The app polls once per second.
+
+`ARTIFACTS_DIR` is the directory containing run UUID directories, rather than one individual run. The CLI creates it when a run starts. The monitor reads this directory without modifying it. It can restart independently of the CLI and display completed runs after the CLI exits. Runs without a recent heartbeat show an unknown status until a terminal result exists. Older binary versions provide archived output but cannot stream live text.
+
+To run the production app in Docker, build from `web` and mount the artifacts read only.
+
+```sh
+docker build -t crabber-monitor web
+docker run --rm -p 127.0.0.1:4173:4173 \
+  -v "$(git -C /path/to/target/repository rev-parse --absolute-git-dir)/crabber-implement:/artifacts:ro" \
+  crabber-monitor
+```
+
+The app displays local agent transcripts and tool output. Keep its listener on localhost. The Docker image contains the monitor. The executor continues to run on the host with its existing Rust dependencies and repository access.
+
+### Read saved artifacts
+
 The terminal prints each stage and the artifact directory.
 Artifacts live under the target repository's Git directory at `crabber-implement/<run-id>/`.
 They include the plan, graph document, session text, tool result logs, stage events, and final status.
+`run.json` records repository, branch, model, and a process heartbeat. Session text and settled tool results are appended as events arrive. Session JSON is written atomically at session start and completion. `result.json` is the terminal workflow outcome.
 Each session also writes `<stage>.session.json` on success or failure after the session starts.
 It records the workflow run ID, Crabber session and run IDs, configured turn budget, observed model-turn count, status, and error.
 These records contain no provider credentials.
@@ -123,6 +152,17 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+Verify the React app and its reader with Node tests, then drive the production Docker app with Playwright.
+
+```sh
+npm --prefix web ci
+npm --prefix web test
+npm --prefix web run build
+python3 scripts/verify_web.py
+```
+
+The Docker journey needs Docker, Node, Cargo, and the sibling Rust checkouts. It uses a local model protocol fixture and no provider key. Playwright checks artifact updates and the real CLI while an implementation session is paused, then verifies completion. Screenshots, browser traces, CLI output, and exported artifacts survive container and fixture cleanup under `.audit/web/`. The browser image is pinned to the installed Playwright version.
 
 `tests/cli.rs` drives the actual binary against a local chat-completions fixture.
 It checks file mutation, local commits, the review-fix-review cycle, malformed review rejection, input failures, and model-turn limits beyond 64 requests.

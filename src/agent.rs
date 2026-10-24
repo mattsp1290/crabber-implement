@@ -6,7 +6,7 @@ use crabber::{
     providers::{HttpAdapter, HttpResolver, Protocol},
 };
 use crabber_tools_catalog::prelude::*;
-use std::{fs, path::Path, sync::Arc, time::Duration};
+use std::{fs, io::Write, path::Path, sync::Arc, time::Duration};
 
 use crate::config::RunConfig;
 
@@ -97,17 +97,29 @@ pub async fn session(
         .policy(Arc::new(StaticPolicy::new(PermissionDecision::Allow)))
         .shared_extension(Arc::new(tools), Scope::Global)
         .build()?;
+    let mut transcript = fs::File::create(config.artifacts.join(format!("{name}.txt")))?;
+    let mut tool_log = fs::File::create(config.artifacts.join(format!("{name}.tools.txt")))?;
     let mut run = agent
         .prompt(None, prompt)
         .await
         .context("start Crabber session")?;
     let session_id = run.session_id().clone();
     let run_id = run.run_id().clone();
+    let evidence_path = config.artifacts.join(format!("{name}.session.json"));
+    let mut evidence = serde_json::json!({
+        "name": name,
+        "workflow_run_id": config.run_id,
+        "session_id": session_id,
+        "run_id": run_id,
+        "max_turns": config.max_turns,
+        "observed_turns": 0,
+        "status": "running",
+        "error": null,
+    });
+    write_json_atomic(&evidence_path, &evidence)?;
     let mut events = run.events();
     let mut observed_turns = 0usize;
     let mut text = String::new();
-    let mut transcript = String::new();
-    let mut tool_log = String::new();
     let deadline = tokio::time::sleep(config.session_timeout);
     tokio::pin!(deadline);
     let outcome = loop {
@@ -120,14 +132,23 @@ pub async fn session(
                     Ok(Some(event)) => {
                         if event.kind == EventKind::TurnStarted {
                             observed_turns += 1;
+                            evidence["observed_turns"] = observed_turns.into();
+                            if let Err(error) = write_json_atomic(&evidence_path, &evidence) {
+                                run.interrupt();
+                                break Err(error);
+                            }
                             text.clear();
                         } else if event.kind == EventKind::TextDelta {
                             let delta = event.payload["text"].as_str().unwrap_or_default();
                             text.push_str(delta);
-                            transcript.push_str(delta);
-                        } else if event.kind == EventKind::ToolCallSettled {
-                            tool_log.push_str(&event.payload.to_string());
-                            tool_log.push('\n');
+                            if let Err(error) = transcript.write_all(delta.as_bytes()) {
+                                run.interrupt();
+                                break Err(anyhow::anyhow!(error).context("write session transcript"));
+                            }
+                        } else if event.kind == EventKind::ToolCallSettled
+                            && let Err(error) = writeln!(tool_log, "{}", event.payload) {
+                            run.interrupt();
+                            break Err(anyhow::anyhow!(error).context("write session tool log"));
                         }
                     }
                     Ok(None) => break Ok(()),
@@ -139,11 +160,6 @@ pub async fn session(
     drop(events);
     let result = run.done().await;
     let close = agent.close_extensions().await;
-    write_text(&config.artifacts.join(format!("{name}.txt")), &transcript)?;
-    write_text(
-        &config.artifacts.join(format!("{name}.tools.txt")),
-        &tool_log,
-    )?;
     let completion = outcome.and_then(|()| {
         let result = result.map_err(|error| {
             if matches!(error, RuntimeError::TurnLimit) {
@@ -166,24 +182,26 @@ pub async fn session(
         }
         Ok(())
     });
-    let evidence = serde_json::json!({
-        "name": name,
-        "workflow_run_id": config.run_id,
-        "session_id": session_id,
-        "run_id": run_id,
-        "max_turns": config.max_turns,
-        "observed_turns": observed_turns,
-        "status": if completion.is_ok() { "completed" } else { "failed" },
-        "error": completion.as_ref().err().map(|error| format!("{error:#}")),
-    });
-    write_text(
-        &config.artifacts.join(format!("{name}.session.json")),
-        &serde_json::to_string_pretty(&evidence)?,
-    )?;
+    evidence["observed_turns"] = observed_turns.into();
+    evidence["status"] = if completion.is_ok() {
+        "completed"
+    } else {
+        "failed"
+    }
+    .into();
+    evidence["error"] = completion
+        .as_ref()
+        .err()
+        .map(|error| format!("{error:#}"))
+        .into();
+    write_json_atomic(&evidence_path, &evidence)?;
     completion?;
     Ok(text)
 }
 
-fn write_text(path: &Path, text: &str) -> Result<()> {
-    fs::write(path, text).with_context(|| format!("write {}", path.display()))
+pub(crate) fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(value)?)
+        .with_context(|| format!("write {}", temporary.display()))?;
+    fs::rename(&temporary, path).with_context(|| format!("replace {}", path.display()))
 }

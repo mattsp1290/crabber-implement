@@ -25,3 +25,9 @@ rustc-ice-*.txt
 
 # Local verification evidence
 .audit/
+
+# React monitor build and browser evidence
+web/node_modules/
+web/dist/
+web/test-results/
+web/playwright-report/

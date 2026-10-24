@@ -14,7 +14,7 @@ use std::{
     io::Write,
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
 
@@ -85,6 +85,23 @@ struct Workflow {
     writer: Mutex<()>,
 }
 
+#[derive(Serialize)]
+struct RunMetadata {
+    version: u32,
+    run_id: String,
+    repo: PathBuf,
+    branch: String,
+    model: String,
+    heartbeat_at_ms: u128,
+}
+
+impl RunMetadata {
+    fn heartbeat(&mut self, path: &std::path::Path) -> Result<()> {
+        self.heartbeat_at_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+        agent::write_json_atomic(path, self)
+    }
+}
+
 pub(crate) fn document(max_reviews: u32, timeout_seconds: u32) -> GraphDocument {
     let task = |id: &str, labels: &[&str], max: u32| {
         json!({
@@ -130,10 +147,18 @@ pub async fn run(config: RunConfig) -> Result<()> {
         serde_json::to_vec_pretty(&document)?,
     )?;
     println!("artifacts {}", config.artifacts.display());
-    println!(
-        "branch {}",
-        git::output(&config.repo, &["branch", "--show-current"])?
-    );
+    let branch = git::output(&config.repo, &["branch", "--show-current"])?;
+    println!("branch {branch}");
+    let metadata_path = config.artifacts.join("run.json");
+    let mut metadata = RunMetadata {
+        version: 1,
+        run_id: config.run_id.clone(),
+        repo: config.repo.clone(),
+        branch,
+        model: config.model.clone(),
+        heartbeat_at_ms: 0,
+    };
+    metadata.heartbeat(&metadata_path)?;
     let graph = compiled.graph.clone();
     let handler = Arc::new(Workflow {
         config,
@@ -158,43 +183,55 @@ pub async fn run(config: RunConfig) -> Result<()> {
             builder = builder.handler(id.clone(), handler.clone());
         }
     }
-    let engine = builder.build()?.start().await?;
-    let run_id = engine.start_run(graph.id(), json!({})).await?;
-    let status = loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                engine.cancel(&run_id, "operator interrupt").await?;
-                break RunStatus::Cancelled;
+    let workflow = async {
+        let engine = builder.build()?.start().await?;
+        let run_id = engine.start_run(graph.id(), json!({})).await?;
+        let status = loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    engine.cancel(&run_id, "operator interrupt").await?;
+                    break RunStatus::Cancelled;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    let run = engine.run(&run_id).await?.context("workflow run disappeared")?;
+                    if run.status.is_terminal() { break run.status; }
+                }
             }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                let run = engine.run(&run_id).await?.context("workflow run disappeared")?;
-                if run.status.is_terminal() { break run.status; }
-            }
-        }
-    };
-    engine.shutdown(Duration::from_secs(30)).await?;
-    fs::write(
-        handler.config.artifacts.join("result.json"),
-        serde_json::to_vec_pretty(
+        };
+        engine.shutdown(Duration::from_secs(30)).await?;
+        agent::write_json_atomic(
+            &handler.config.artifacts.join("result.json"),
             &json!({"run_id":run_id,"status":status,"error":*handler.error.lock().await}),
-        )?,
-    )?;
-    ensure!(
-        status == RunStatus::Completed,
-        "workflow {status}: {}. Artifacts: {}",
-        handler
-            .error
-            .lock()
-            .await
-            .as_deref()
-            .unwrap_or("see result.json"),
-        handler.config.artifacts.display()
+        )?;
+        ensure!(
+            status == RunStatus::Completed,
+            "workflow {status}: {}. Artifacts: {}",
+            handler
+                .error
+                .lock()
+                .await
+                .as_deref()
+                .unwrap_or("see result.json"),
+            handler.config.artifacts.display()
+        );
+        println!(
+            "done {}",
+            git::output(&handler.config.repo, &["rev-parse", "HEAD"])?
+        );
+        Ok(())
+    };
+    tokio::pin!(workflow);
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
     );
-    println!(
-        "done {}",
-        git::output(&handler.config.repo, &["rev-parse", "HEAD"])?
-    );
-    Ok(())
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut workflow => return result,
+            _ = heartbeat.tick() => metadata.heartbeat(&metadata_path)?,
+        }
+    }
 }
 
 #[async_trait]
