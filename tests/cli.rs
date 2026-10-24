@@ -1,0 +1,401 @@
+use serde_json::{Value, json};
+use std::{
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+    path::Path,
+    process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
+};
+
+fn git(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn repository() -> tempfile::TempDir {
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Fixture"]);
+    git(repo.path(), &["config", "user.email", "fixture@localhost"]);
+    std::fs::write(repo.path().join("README.md"), "Fixture project.\n").unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "initial"]);
+    for (name, instructions) in [
+        (
+            "review",
+            "Review independently. Identify Critical, Important, and Suggestion findings.",
+        ),
+        (
+            "fix-review",
+            "Apply the selected findings automatically. Preserve needs-manual handling and emit the auto-summary block.",
+        ),
+    ] {
+        let folder = repo.path().join(".git/fixture-skills").join(name);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("SKILL.md"), instructions).unwrap();
+    }
+    repo
+}
+
+struct Fixture {
+    address: String,
+    stop: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Fixture {
+    fn start(repo: &Path, invalid_review: bool) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let repo = repo.to_path_buf();
+        let worker = thread::spawn(move || {
+            let mut connections = Vec::new();
+            while !stopped.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let repo = repo.clone();
+                        connections.push(thread::spawn(move || {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let body = request(&mut stream);
+                        let serialized = body.to_string();
+                        let has_result = body["messages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|message| message["role"] == "tool");
+                        let response = if serialized
+                            .contains("Perform your assigned independent review")
+                        {
+                            assert!(!serialized.contains("external-secret-sentinel"), "host followed a committed symlink outside the review snapshot");
+                            let tools = body["tools"].as_array().unwrap();
+                            assert!(tools.iter().all(|tool| !matches!(tool["function"]["name"].as_str(), Some("shell" | "file_write" | "file_edit" | "apply_patch"))));
+
+                            if invalid_review {
+                                text("not a review")
+                            } else {
+                                let approved = serialized.contains("EXTERNAL_SYMLINK") || std::fs::read_to_string(repo.join("hello.txt"))
+                                    .unwrap_or_default()
+                                    == "fixed\n";
+                                text(&report(approved).to_string())
+                            }
+                        } else if serialized.contains("Execute the following fix-review skill") {
+                            if has_result {
+                                text("<!-- auto-summary fixed:1 skipped:0 needs-manual:0 -->")
+                            } else {
+                                tool(
+                                    "file_edit",
+                                    json!({"path":"hello.txt","anchor":"initial","replacement":"fixed"}),
+                                )
+                            }
+                        } else if !has_result && serialized.contains("DRIFT_BRANCH") {
+                            tool("shell", json!({"cmd":"git switch -c unexpected"}))
+                        } else if !has_result && serialized.contains("EXTERNAL_SYMLINK") {
+                            tool("shell", json!({"cmd":"ln -s .git/external-secret leak.txt"}))
+                        } else if has_result {
+                            text("Implemented the plan and verified hello.txt.")
+                        } else {
+                            tool(
+                                "file_write",
+                                json!({"path":"hello.txt","content":"initial\n"}),
+                            )
+                        };
+                        let payload = format!("data: {}\n\ndata: [DONE]\n\n", response);
+                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload).unwrap();
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(error) => panic!("fixture listener: {error}"),
+                }
+            }
+            for connection in connections {
+                connection.join().unwrap();
+            }
+        });
+        Self {
+            address,
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let result = self.worker.take().unwrap().join();
+        if !thread::panicking() {
+            result.unwrap();
+        }
+    }
+}
+
+fn request(stream: &mut TcpStream) -> Value {
+    let mut bytes = Vec::new();
+    let (header_end, length) = loop {
+        let mut buffer = [0; 8192];
+        let count = stream.read(&mut buffer).unwrap();
+        assert!(count > 0, "request ended before headers");
+        bytes.extend_from_slice(&buffer[..count]);
+        if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&bytes[..end]);
+            assert!(headers.starts_with("POST /chat/completions "));
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|value| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            break (end + 4, length);
+        }
+    };
+    while bytes.len() < header_end + length {
+        let mut buffer = [0; 8192];
+        let count = stream.read(&mut buffer).unwrap();
+        assert!(count > 0);
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap()
+}
+
+fn text(content: &str) -> Value {
+    json!({"choices":[{"index":0,"delta":{"content":content},"finish_reason":"stop"}]})
+}
+
+fn tool(name: &str, arguments: Value) -> Value {
+    json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"fixture-call","type":"function","function":{"name":name,"arguments":arguments.to_string()}}]},"finish_reason":"tool_calls"}]})
+}
+
+fn report(approved: bool) -> Value {
+    json!({"verdict":if approved {"APPROVE"} else {"REQUEST_CHANGES"},"summary":"Reviewed the greeting implementation.","positive_notes":[],"findings":if approved {json!([])} else {json!([{"severity":"Important","path":"hello.txt","line":1,"description":"Greeting is initial.","suggested_fix":"Replace initial with fixed."}])}})
+}
+
+#[test]
+fn cli_implements_fixes_and_requires_fresh_review() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let plan_dir = tempfile::tempdir().unwrap();
+    let plan = plan_dir.path().join("plan.md");
+    std::fs::write(&plan, "Create hello.txt with the requested greeting.\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+        .arg(&plan)
+        .arg("--repo")
+        .arg(repo.path())
+        .arg("--skills-dir")
+        .arg(repo.path().join(".git/fixture-skills"))
+        .arg("--base-url")
+        .arg(format!("http://{}", fixture.address))
+        .arg("--session-timeout")
+        .arg("20")
+        .env("HOME", repo.path())
+        .env("OPENCODE_GO_API_KEY", "fixture-key")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout {}\nstderr {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("hello.txt")).unwrap(),
+        "fixed\n"
+    );
+    assert!(
+        git(repo.path(), &["status", "--porcelain"])
+            .trim()
+            .is_empty()
+    );
+    assert_eq!(
+        git(repo.path(), &["rev-list", "--count", "main..HEAD"]).trim(),
+        "2"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("fix-review 1"));
+    assert!(stdout.contains("review 2"));
+    assert!(stdout.contains("done "));
+    assert_eq!(
+        std::fs::read_dir(repo.path().join("reviews"))
+            .unwrap()
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn malformed_review_cannot_complete_workflow() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), true);
+    let plan_dir = tempfile::tempdir().unwrap();
+    let plan = plan_dir.path().join("plan.md");
+    std::fs::write(&plan, "Create hello.txt.\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+        .arg(&plan)
+        .arg("--repo")
+        .arg(repo.path())
+        .arg("--skills-dir")
+        .arg(repo.path().join(".git/fixture-skills"))
+        .arg("--base-url")
+        .arg(format!("http://{}", fixture.address))
+        .arg("--session-timeout")
+        .arg("20")
+        .env("HOME", repo.path())
+        .env("OPENCODE_GO_API_KEY", "fixture-key")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("structured JSON report"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("done "));
+}
+
+#[test]
+fn missing_plan_and_dirty_repository_fail_before_network() {
+    let output = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+        .arg("/does/not/exist.md")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("plan path does not exist"));
+    let repo = repository();
+    let plan = tempfile::NamedTempFile::with_suffix(".md").unwrap();
+    std::fs::write(plan.path(), "Implement the task.").unwrap();
+    std::fs::write(repo.path().join("uncommitted.txt"), "keep me").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+        .arg(plan.path())
+        .arg("--repo")
+        .arg(repo.path())
+        .arg("--skills-dir")
+        .arg(repo.path().join(".git/fixture-skills"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("uncommitted changes"));
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("uncommitted.txt")).unwrap(),
+        "keep me"
+    );
+}
+
+#[test]
+fn exhausted_review_budget_never_runs_fixes_or_claims_done() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let plan = tempfile::NamedTempFile::with_suffix(".md").unwrap();
+    std::fs::write(plan.path(), "Create hello.txt.").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+        .arg(plan.path())
+        .arg("--repo")
+        .arg(repo.path())
+        .arg("--skills-dir")
+        .arg(repo.path().join(".git/fixture-skills"))
+        .arg("--base-url")
+        .arg(format!("http://{}", fixture.address))
+        .arg("--max-reviews")
+        .arg("1")
+        .arg("--session-timeout")
+        .arg("20")
+        .env("HOME", repo.path())
+        .env("OPENCODE_GO_API_KEY", "fixture-key")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("review budget exhausted"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("fix-review 1"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("done "));
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("hello.txt")).unwrap(),
+        "initial\n"
+    );
+}
+
+#[test]
+fn agent_branch_drift_stops_before_host_commit() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let plan = tempfile::NamedTempFile::with_suffix(".md").unwrap();
+    std::fs::write(plan.path(), "DRIFT_BRANCH").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+        .arg(plan.path())
+        .arg("--repo")
+        .arg(repo.path())
+        .arg("--skills-dir")
+        .arg(repo.path().join(".git/fixture-skills"))
+        .arg("--base-url")
+        .arg(format!("http://{}", fixture.address))
+        .arg("--session-timeout")
+        .arg("20")
+        .env("HOME", repo.path())
+        .env("OPENCODE_GO_API_KEY", "fixture-key")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("changed branch or HEAD"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        git(repo.path(), &["rev-list", "--count", "main..HEAD"]).trim(),
+        "0"
+    );
+}
+
+#[test]
+fn review_reads_committed_symlink_text_without_target_contents() {
+    let repo = repository();
+    std::fs::write(
+        repo.path().join(".git/external-secret"),
+        "external-secret-sentinel",
+    )
+    .unwrap();
+    let fixture = Fixture::start(repo.path(), false);
+    let plan = tempfile::NamedTempFile::with_suffix(".md").unwrap();
+    std::fs::write(plan.path(), "EXTERNAL_SYMLINK").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+        .arg(plan.path())
+        .arg("--repo")
+        .arg(repo.path())
+        .arg("--skills-dir")
+        .arg(repo.path().join(".git/fixture-skills"))
+        .arg("--base-url")
+        .arg(format!("http://{}", fixture.address))
+        .arg("--session-timeout")
+        .arg("20")
+        .env("HOME", repo.path())
+        .env("OPENCODE_GO_API_KEY", "fixture-key")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_link(repo.path().join("leak.txt")).unwrap(),
+        Path::new(".git/external-secret")
+    );
+}
