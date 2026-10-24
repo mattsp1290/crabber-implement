@@ -21,7 +21,7 @@ Every completed workflow has implemented the plan and received a fresh approval 
 
 The checker is `crabber-workflow-checker-v1` in `src/formal_verification.rs`. The covered product code is `src/workflow.rs`, specifically `document` and `occurrence_allowed`. Read the handler's `execute` and `review` methods when changing either function to confirm their outcome labels still mean what the checker models.
 
-The synchronization commit is `3b07798647ecc4ce4028140e2ce7f851deb6edfb`. Its covered source bytes match the hashes from the passing `.audit/formal/result.json`. That record also captures tool versions. Move this commit forward only after confirming the checker still describes the covered implementation and rerunning the command.
+The synchronization commit is `0cb3f9ac46104d789e4234d8c594d773483542cf`. The React monitor update changes artifact publication around execution, while `document` and `occurrence_allowed` remain unchanged. The passing `.audit/formal/result.json` records the covered source hashes and tool versions. Recheck the model and advance this commit when covered execution behavior changes.
 
 ## Tool and scope
 
