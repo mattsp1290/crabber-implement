@@ -6,7 +6,7 @@ use std::{
     process::Command,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
@@ -55,6 +55,7 @@ fn repository() -> tempfile::TempDir {
 struct Fixture {
     address: String,
     stop: Arc<AtomicBool>,
+    implementation_requests: Arc<AtomicUsize>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -65,6 +66,8 @@ impl Fixture {
         let address = listener.local_addr().unwrap().to_string();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
+        let implementation_requests = Arc::new(AtomicUsize::new(0));
+        let requests = implementation_requests.clone();
         let repo = repo.to_path_buf();
         let worker = thread::spawn(move || {
             let mut connections = Vec::new();
@@ -72,6 +75,7 @@ impl Fixture {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let repo = repo.clone();
+                        let requests = requests.clone();
                         connections.push(thread::spawn(move || {
                         stream.set_nonblocking(false).unwrap();
                         stream
@@ -108,6 +112,17 @@ impl Fixture {
                                     json!({"path":"hello.txt","anchor":"initial","replacement":"fixed"}),
                                 )
                             }
+                        } else if serialized.contains("LONG_TURNS") {
+                            requests.fetch_add(1, Ordering::Relaxed);
+                            let tool_results = body["messages"].as_array().unwrap().iter()
+                                .filter(|message| message["role"] == "tool").count();
+                            if tool_results == 0 {
+                                tool("file_write", json!({"path":"hello.txt","content":"initial\n"}))
+                            } else if tool_results < 65 {
+                                tool("file_read", json!({"path":"hello.txt"}))
+                            } else {
+                                text("Implemented the plan after 65 tool responses.")
+                            }
                         } else if !has_result && serialized.contains("DRIFT_BRANCH") {
                             tool("shell", json!({"cmd":"git switch -c unexpected"}))
                         } else if !has_result && serialized.contains("EXTERNAL_SYMLINK") {
@@ -137,6 +152,7 @@ impl Fixture {
         Self {
             address,
             stop,
+            implementation_requests,
             worker: Some(worker),
         }
     }
@@ -187,7 +203,9 @@ fn text(content: &str) -> Value {
 }
 
 fn tool(name: &str, arguments: Value) -> Value {
-    json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"fixture-call","type":"function","function":{"name":name,"arguments":arguments.to_string()}}]},"finish_reason":"tool_calls"}]})
+    static CALL_ID: AtomicUsize = AtomicUsize::new(0);
+    let id = format!("fixture-call-{}", CALL_ID.fetch_add(1, Ordering::Relaxed));
+    json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":arguments.to_string()}}]},"finish_reason":"tool_calls"}]})
 }
 
 fn report(approved: bool) -> Value {
@@ -398,4 +416,138 @@ fn review_reads_committed_symlink_text_without_target_contents() {
         std::fs::read_link(repo.path().join("leak.txt")).unwrap(),
         Path::new(".git/external-secret")
     );
+}
+
+fn long_turn_run(
+    repo: &Path,
+    fixture: &Fixture,
+    extra_args: &[&str],
+    max_turns_env: Option<&str>,
+) -> std::process::Output {
+    let plan = tempfile::NamedTempFile::with_suffix(".md").unwrap();
+    std::fs::write(
+        plan.path(),
+        "LONG_TURNS Create hello.txt after a long tool journey.",
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_crabber-implement"));
+    command
+        .arg(plan.path())
+        .arg("--repo")
+        .arg(repo)
+        .arg("--skills-dir")
+        .arg(repo.join(".git/fixture-skills"))
+        .arg("--base-url")
+        .arg(format!("http://{}", fixture.address))
+        .arg("--session-timeout")
+        .arg("30")
+        .args(extra_args)
+        .env_remove("CRABBER_IMPLEMENT_MAX_TURNS")
+        .env("HOME", repo)
+        .env("OPENCODE_GO_API_KEY", "fixture-key");
+    if let Some(value) = max_turns_env {
+        command.env("CRABBER_IMPLEMENT_MAX_TURNS", value);
+    }
+    command.output().unwrap()
+}
+
+fn run_artifacts(repo: &Path) -> std::path::PathBuf {
+    std::fs::read_dir(repo.join(".git/crabber-implement"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+}
+
+fn session_evidence(repo: &Path) -> Value {
+    serde_json::from_slice(
+        &std::fs::read(run_artifacts(repo).join("implement.session.json")).unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn default_turn_budget_allows_more_than_64_model_turns() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let output = long_turn_run(repo.path(), &fixture, &[], None);
+    assert!(
+        output.status.success(),
+        "stdout {}\nstderr {}\nimplementation requests {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        fixture.implementation_requests.load(Ordering::Relaxed)
+    );
+    assert_eq!(fixture.implementation_requests.load(Ordering::Relaxed), 66);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("done "));
+    let evidence = session_evidence(repo.path());
+    assert_eq!(evidence["max_turns"], 256);
+    assert_eq!(evidence["observed_turns"], 66);
+    assert_eq!(evidence["status"], "completed");
+    assert!(
+        evidence["session_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+    assert!(evidence["run_id"].as_str().is_some_and(|id| !id.is_empty()));
+    assert!(evidence["error"].is_null());
+}
+
+#[test]
+fn explicit_turn_budget_fails_with_preserved_evidence() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let output = long_turn_run(repo.path(), &fixture, &["--max-turns", "3"], Some("2"));
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("turn limit of 3 after 3 observed model turns")
+            && stderr.contains("--max-turns"),
+        "{stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("done "));
+    assert!(!stdout.contains("review 1"));
+    assert_eq!(fixture.implementation_requests.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("hello.txt")).unwrap(),
+        "initial\n"
+    );
+    assert_eq!(
+        git(repo.path(), &["rev-list", "--count", "main..HEAD"]).trim(),
+        "0"
+    );
+    let evidence = session_evidence(repo.path());
+    assert_eq!(evidence["max_turns"], 3);
+    assert_eq!(evidence["observed_turns"], 3);
+    assert_eq!(evidence["status"], "failed");
+    assert!(evidence["error"].as_str().unwrap().contains("turn limit"));
+    assert!(!evidence.to_string().contains("fixture-key"));
+    let artifacts = run_artifacts(repo.path());
+    assert!(artifacts.join("implement.txt").is_file());
+    let tool_log = std::fs::read_to_string(artifacts.join("implement.tools.txt")).unwrap();
+    assert_eq!(tool_log.lines().count(), 3);
+}
+
+#[test]
+fn environment_turn_budget_is_used_and_zero_is_rejected() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let output = long_turn_run(repo.path(), &fixture, &[], Some("2"));
+    assert!(!output.status.success());
+    assert_eq!(fixture.implementation_requests.load(Ordering::Relaxed), 2);
+    let evidence = session_evidence(repo.path());
+    assert_eq!(evidence["max_turns"], 2);
+    assert_eq!(evidence["observed_turns"], 2);
+    for args in [vec!["--max-turns", "0"], vec![]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+            .arg("/does/not/exist.md")
+            .args(args)
+            .env("CRABBER_IMPLEMENT_MAX_TURNS", "0")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("invalid value '0'"));
+    }
 }
