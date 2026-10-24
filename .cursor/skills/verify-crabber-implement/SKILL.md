@@ -14,7 +14,7 @@ cargo build --locked
 ./target/debug/crabber-implement --help
 ```
 
-The executable prints `Usage: crabber-implement [OPTIONS] <PLAN>`. Each invocation exits when its workflow finishes. There is no server to keep running. It requires Git and ripgrep 14 or later. The live provider requires `OPENCODE_GO_API_KEY` in the environment. The CLI does not source `~/.profile`.
+The executable prints `Usage: crabber-implement [OPTIONS] <PLAN>`. Each invocation exits when its workflow finishes. The React monitor is a separate process. It requires Git and ripgrep 14 or later. The live provider requires `OPENCODE_GO_API_KEY` in the environment. The CLI does not source `~/.profile`.
 
 ## Doctor
 
@@ -47,6 +47,8 @@ python3 scripts/verify_live.py --evidence .audit/live
 This helper creates a disposable Git repository and a plan. It runs the actual executable with GLM-5.2, then independently runs the requested Python program and compares its output. It copies workflow and review artifacts before deleting its scratch repository. A failed assertion means the journey failed. Read the captured stderr and result rather than assuming a model summary proves success.
 
 For a turn-limit regression, run the focused [model turn budget journey](features/turn-budget.md). It exercises more than 64 model requests through the actual executable and verifies explicit-budget failure. It uses no live provider credential.
+
+For the React monitor, run the [Docker and Playwright journey](features/monitor.md). It launches the production monitor in Docker, drives real artifact updates through a browser, and observes the actual CLI before and after a paused model response. No provider credential is needed.
 
 ## Evidence
 
