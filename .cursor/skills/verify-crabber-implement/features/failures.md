@@ -2,11 +2,11 @@
 
 ## Sub-features
 
-Reject malformed review output, missing reports, contradictory approvals, manual fix requirements, and exhausted review budgets. Reject dirty repositories and missing plans before model execution.
+Reject malformed review output, missing reports, contradictory approvals, manual fix requirements, exhausted review budgets, and exhausted model turn budgets. Reject dirty repositories and missing plans before model execution.
 
 ## How to get to it (user POV)
 
-Invoke the same CLI with `--max-reviews` to bound the loop. Errors print to stderr and return a nonzero exit code. Completed checkpoints and reports remain available for inspection.
+Invoke the same CLI with `--max-reviews` to bound the loop. Errors print to stderr and return a nonzero exit code. Completed checkpoints and reports remain available for inspection. Turn-limit errors identify the configured cap and the `--max-turns` setting.
 
 ## Driving it with the CLI harness
 

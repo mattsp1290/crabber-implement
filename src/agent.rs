@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use crabber::{
-    Agent, AgentConfig, EventKind, PermissionDecision, Selection, StaticPolicy,
+    Agent, AgentConfig, EventKind, PermissionDecision, RuntimeError, Selection, StaticPolicy,
     core::RunStatus,
     extension::Scope,
     providers::{HttpAdapter, HttpResolver, Protocol},
@@ -90,6 +90,7 @@ pub async fn session(
     ));
     let agent = Agent::builder()
         .behavior_version("crabber-implement.v1")
+        .max_turns(config.max_turns.get())
         .memory()
         .provider(Arc::new(resolver))
         .config(agent_config)
@@ -100,7 +101,10 @@ pub async fn session(
         .prompt(None, prompt)
         .await
         .context("start Crabber session")?;
+    let session_id = run.session_id().clone();
+    let run_id = run.run_id().clone();
     let mut events = run.events();
+    let mut observed_turns = 0usize;
     let mut text = String::new();
     let mut transcript = String::new();
     let mut tool_log = String::new();
@@ -115,13 +119,14 @@ pub async fn session(
                 match event {
                     Ok(Some(event)) => {
                         if event.kind == EventKind::TurnStarted {
+                            observed_turns += 1;
                             text.clear();
                         } else if event.kind == EventKind::TextDelta {
                             let delta = event.payload["text"].as_str().unwrap_or_default();
                             text.push_str(delta);
                             transcript.push_str(delta);
                         } else if event.kind == EventKind::ToolCallSettled {
-                            tool_log.push_str(&serde_json::to_string(&event.payload)?);
+                            tool_log.push_str(&event.payload.to_string());
                             tool_log.push('\n');
                         }
                     }
@@ -139,16 +144,43 @@ pub async fn session(
         &config.artifacts.join(format!("{name}.tools.txt")),
         &tool_log,
     )?;
-    outcome?;
-    let result = result?;
-    close?;
-    if result.status != RunStatus::Completed {
-        bail!(
-            "Crabber session {name} ended with {:?}; see {}",
-            result.status,
-            config.artifacts.display()
-        );
-    }
+    let completion = outcome.and_then(|()| {
+        let result = result.map_err(|error| {
+            if matches!(error, RuntimeError::TurnLimit) {
+                anyhow::anyhow!(
+                    "Crabber session {name} reached its turn limit of {} after {observed_turns} observed model turns; use --max-turns to set a larger per-session budget. Partial edits are preserved; see {}",
+                    config.max_turns,
+                    config.artifacts.display()
+                )
+            } else {
+                anyhow::anyhow!(error)
+            }
+        })?;
+        close?;
+        if result.status != RunStatus::Completed {
+            bail!(
+                "Crabber session {name} ended with {:?}; see {}",
+                result.status,
+                config.artifacts.display()
+            );
+        }
+        Ok(())
+    });
+    let evidence = serde_json::json!({
+        "name": name,
+        "workflow_run_id": config.run_id,
+        "session_id": session_id,
+        "run_id": run_id,
+        "max_turns": config.max_turns,
+        "observed_turns": observed_turns,
+        "status": if completion.is_ok() { "completed" } else { "failed" },
+        "error": completion.as_ref().err().map(|error| format!("{error:#}")),
+    });
+    write_text(
+        &config.artifacts.join(format!("{name}.session.json")),
+        &serde_json::to_string_pretty(&evidence)?,
+    )?;
+    completion?;
     Ok(text)
 }
 

@@ -50,7 +50,7 @@ product behavior is required.
         result = run(argv, repo)
         result.check_returncode()
     started = time.time()
-    result = run([str(binary), str(plan), '--repo', str(repo), '--max-reviews', '3', '--session-timeout', '240'], repo, timeout=1600)
+    result = run([str(binary), str(plan), '--repo', str(repo), '--max-reviews', '3', '--max-turns', '256', '--session-timeout', '240'], repo, timeout=1600)
     (evidence / 'stdout.txt').write_text(result.stdout)
     (evidence / 'stderr.txt').write_text(result.stderr)
     actual = run(['python3', 'hello.py'], repo)
@@ -71,8 +71,14 @@ product behavior is required.
         for reviewer in final_manifest.get('reviewers', [])
         for filename in ['00-overview.md', '01-critical-and-important.md', '02-suggestions.md', '03-positive-notes.md', '04-action-items.md']
     ) and len(final_manifest.get('reviewers', [])) == 2
-    workflow_results = list((evidence / 'crabber-implement').glob('*/result.json'))
+    workflow_results = list((repo / '.git' / 'crabber-implement').glob('*/result.json'))
     workflow_completed = bool(workflow_results) and json.loads(workflow_results[-1].read_text()).get('status') == 'completed'
+    sessions = [json.loads(path.read_text()) for path in (repo / '.git' / 'crabber-implement').glob('*/*.session.json')]
+    session_evidence_present = len(sessions) >= 3 and all(
+        session.get('session_id') and session.get('run_id') and session.get('max_turns') == 256
+        and session.get('observed_turns', 0) > 0 and session.get('status') == 'completed'
+        for session in sessions
+    )
     summary = {
         'exit_code': result.returncode,
         'program_exit_code': actual.returncode,
@@ -81,6 +87,7 @@ product behavior is required.
         'review_matches_head': final_manifest.get('head_sha') == head,
         'review_files_present': review_files_present,
         'workflow_completed': workflow_completed,
+        'session_evidence_present': session_evidence_present,
         'elapsed_seconds': round(time.time() - started, 1),
         'scratch_repository_removed_on_exit': True,
     }
@@ -88,5 +95,5 @@ product behavior is required.
     print(json.dumps(summary))
     assert result.returncode == 0, 'CLI failed. Read evidence stdout.txt and stderr.txt.'
     assert actual.returncode == 0 and summary['program_output_matches'], 'Plan acceptance criterion failed.'
-    assert all(summary[key] for key in ['clean_repository', 'review_matches_head', 'review_files_present', 'workflow_completed']), 'Review or repository evidence failed.'
+    assert all(summary[key] for key in ['clean_repository', 'review_matches_head', 'review_files_present', 'workflow_completed', 'session_evidence_present']), 'Review or repository evidence failed.'
 assert (evidence / 'result.json').is_file(), 'Evidence did not survive cleanup.'

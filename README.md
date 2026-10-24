@@ -13,6 +13,8 @@ Keep these checkouts beside each other:
 ~/git/dmt-flows
 ```
 
+The Crabber checkout must include the public `AgentBuilder::max_turns` API.
+
 Build the binary:
 
 ```sh
@@ -51,6 +53,7 @@ crabber-implement /path/to/plan \
   --base main \
   --model glm-5.2 \
   --max-reviews 4 \
+  --max-turns 256 \
   --session-timeout 1800 \
   --skills-dir "$HOME/git/dotfiles/.agents/skills"
 ```
@@ -63,6 +66,13 @@ The program reads both files for every invocation and supplies their instruction
 Its default is `https://opencode.ai/zen/go/v1`.
 `CRABBER_IMPLEMENT_BASE_URL` and `CRABBER_IMPLEMENT_MODEL` provide environment defaults.
 
+`--max-turns` sets a positive model-turn budget for each agent session. Its default is 256.
+`CRABBER_IMPLEMENT_MAX_TURNS` provides the environment default. The flag takes precedence.
+A model turn includes one model response and its tool batch. The final answer also consumes a turn.
+Provider retries and compaction do not add outer turns.
+The turn budget and `--session-timeout` apply independently.
+Reaching either limit stops the workflow and preserves partial edits. The program does not restart the task automatically.
+
 The review budget includes the first review. Exhausting it returns a nonzero exit code and preserves findings.
 `NEEDS_DISCUSSION`, malformed reports, agent failures, and fixes marked `needs-manual` also stop the run.
 Control-C interrupts the active agents and preserves their artifacts.
@@ -72,6 +82,10 @@ Control-C interrupts the active agents and preserves their artifacts.
 The terminal prints each stage and the artifact directory.
 Artifacts live under the target repository's Git directory at `crabber-implement/<run-id>/`.
 They include the plan, graph document, session text, tool result logs, stage events, and final status.
+Each session also writes `<stage>.session.json` on success or failure after the session starts.
+It records the workflow run ID, Crabber session and run IDs, configured turn budget, observed model-turn count, status, and error.
+These records contain no provider credentials.
+The CLI writes diagnostics locally and does not configure a Datadog exporter.
 
 Review reports live at `reviews/<run-id>-<round>/` in the target repository.
 Each round has a `review-v1` manifest and two reviewer directories with the five files required by the review skill.
@@ -111,7 +125,7 @@ cargo test
 ```
 
 `tests/cli.rs` drives the actual binary against a local chat-completions fixture.
-It checks file mutation, local commits, the review-fix-review cycle, malformed review rejection, and input failures.
+It checks file mutation, local commits, the review-fix-review cycle, malformed review rejection, input failures, and model-turn limits beyond 64 requests.
 The fixture replaces the external model boundary. It uses the real Crabber tools and DMT engine.
 
 The project-local verification skills document the live model journey and the bounded workflow check.

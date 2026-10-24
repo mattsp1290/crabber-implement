@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
-use std::{fs, path::PathBuf, time::Duration};
+use std::{fs, num::NonZeroUsize, path::PathBuf, time::Duration};
 
 use crate::git;
 
@@ -32,6 +32,9 @@ pub struct Cli {
     pub base_url: String,
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=100))]
     pub max_reviews: u32,
+    /// Maximum model turns per agent session.
+    #[arg(long, env = "CRABBER_IMPLEMENT_MAX_TURNS", default_value = "256")]
+    pub max_turns: NonZeroUsize,
     /// Maximum wall time per agent session.
     #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..))]
     pub session_timeout: u64,
@@ -46,6 +49,7 @@ pub struct RunConfig {
     pub model: String,
     pub base_url: String,
     pub max_reviews: u32,
+    pub max_turns: NonZeroUsize,
     pub session_timeout: Duration,
     pub artifacts: PathBuf,
     pub run_id: String,
@@ -189,6 +193,7 @@ impl RunConfig {
             model: cli.model,
             base_url: cli.base_url,
             max_reviews: cli.max_reviews,
+            max_turns: cli.max_turns,
             session_timeout: Duration::from_secs(cli.session_timeout),
             artifacts,
             run_id,

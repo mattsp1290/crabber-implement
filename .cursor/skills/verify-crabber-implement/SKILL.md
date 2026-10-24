@@ -46,9 +46,11 @@ python3 scripts/verify_live.py --evidence .audit/live
 
 This helper creates a disposable Git repository and a plan. It runs the actual executable with GLM-5.2, then independently runs the requested Python program and compares its output. It copies workflow and review artifacts before deleting its scratch repository. A failed assertion means the journey failed. Read the captured stderr and result rather than assuming a model summary proves success.
 
+For a turn-limit regression, run the focused [model turn budget journey](features/turn-budget.md). It exercises more than 64 model requests through the actual executable and verifies explicit-budget failure. It uses no live provider credential.
+
 ## Evidence
 
-Deterministic evidence is `.audit/verification/cli.txt`. Live evidence is `.audit/live/result.json`, `stdout.txt`, `stderr.txt`, `program.txt`, `hello.py`, `git-log.txt`, `git-status.txt`, and the copied review and workflow directories. Require a successful CLI exit, the expected program output, review manifests tied to the resulting revision, and stage records. A model's implementation summary alone is insufficient.
+Deterministic evidence is `.audit/verification/cli.txt`. Live evidence is `.audit/live/result.json`, `stdout.txt`, `stderr.txt`, `program.txt`, `hello.py`, `git-log.txt`, `git-status.txt`, and the copied review and workflow directories. Require a successful CLI exit, the expected program output, review manifests tied to the resulting revision, and stage records. Each stage also records a `.session.json` with session and run IDs, configured turn budget, observed turns, and outcome, including failed runs. A model's implementation summary alone is insufficient.
 
 The live helper uses the default external skill checkout under `~/git/dotfiles/.agents/skills`. Its exact skill text can change results. The fixture uses isolated skill files to keep protocol tests deterministic. Shell tools execute on the host. The CLI's acquire and release graph hooks do not create a sandbox.
 
