@@ -1,0 +1,31 @@
+[package]
+name = "crabber-implement"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+crabber = { path = "../crabber/crates/crabber", features = ["opencode-go"] }
+crabber-tools-catalog = { path = "../crabber/crates/crabber-tools-catalog" }
+dmt = { git = "https://github.com/mattsp1290/dmt", rev = "f7f4e5f564939a729b37f230c427aabc8bdbdb66" }
+flows-api = { path = "../dmt-flows/crates/flows-api" }
+flows-core = { path = "../dmt-flows/crates/flows-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "process", "io-util", "net"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
