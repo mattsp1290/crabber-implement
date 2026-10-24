@@ -5,7 +5,7 @@ use std::{
     path::Path,
     process::Command,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
@@ -57,6 +57,7 @@ struct Fixture {
     stop: Arc<AtomicBool>,
     implementation_requests: Arc<AtomicUsize>,
     stream_release: Arc<AtomicBool>,
+    history: Arc<Mutex<Vec<Value>>>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -71,6 +72,8 @@ impl Fixture {
         let requests = implementation_requests.clone();
         let stream_release = Arc::new(AtomicBool::new(false));
         let release = stream_release.clone();
+        let history = Arc::new(Mutex::new(Vec::new()));
+        let histories = history.clone();
         let repo = repo.to_path_buf();
         let worker = thread::spawn(move || {
             let mut connections = Vec::new();
@@ -81,12 +84,14 @@ impl Fixture {
                         let requests = requests.clone();
                         let release = release.clone();
                         let stopped = stopped.clone();
+                        let histories = histories.clone();
                         connections.push(thread::spawn(move || {
                         stream.set_nonblocking(false).unwrap();
                         stream
                             .set_read_timeout(Some(Duration::from_secs(5)))
                             .unwrap();
                         let body = request(&mut stream);
+                        histories.lock().unwrap().push(body.clone());
                         let serialized = body.to_string();
                         let has_result = body["messages"]
                             .as_array()
@@ -116,6 +121,28 @@ impl Fixture {
                                     "file_edit",
                                     json!({"path":"hello.txt","anchor":"initial","replacement":"fixed"}),
                                 )
+                            }
+                        } else if serialized.contains("COMPLETION_") {
+                            let attempt = requests.fetch_add(1, Ordering::Relaxed);
+                            let continued = body["messages"].as_array().unwrap().iter().any(|message| message["role"] == "user" && message["content"].as_str().is_some_and(|value| !value.contains("COMPLETION_")));
+                            if serialized.contains("COMPLETION_BLOCKED") {
+                                text("BLOCKED: The required fixture dependency is unavailable.")
+                            } else if serialized.contains("COMPLETION_TRUNCATED_TOOL") {
+                                let mut response = tool("file_write", json!({"path":"unsafe.txt","content":"must not run"}));
+                                response["choices"][0]["finish_reason"] = "length".into();
+                                response
+                            } else if serialized.contains("COMPLETION_FILTERED") {
+                                json!({"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]})
+                            } else if serialized.contains("COMPLETION_EMPTY") || (serialized.contains("COMPLETION_RECOVER") && attempt == 1) {
+                                json!({"choices":[{"index":0,"delta":{"reasoning_content":"Private fixture reasoning."},"finish_reason":"stop"}]})
+                            } else if serialized.contains("COMPLETION_LENGTH") && !continued {
+                                json!({"choices":[{"index":0,"delta":{"content":"Partial narration"},"finish_reason":"length"}]})
+                            } else if serialized.contains("COMPLETION_RECOVER") && attempt == 0 {
+                                tool("file_read", json!({"path":"README.md"}))
+                            } else if !serialized.contains("hello.txt") {
+                                tool("file_write", json!({"path":"hello.txt","content":"initial\n"}))
+                            } else {
+                                text("Implemented the plan. The BLOCKED marker is documented in README.md.")
                             }
                         } else if serialized.contains("LONG_TURNS") {
                             requests.fetch_add(1, Ordering::Relaxed);
@@ -174,6 +201,7 @@ impl Fixture {
             stop,
             implementation_requests,
             stream_release,
+            history,
             worker: Some(worker),
         }
     }
@@ -730,4 +758,93 @@ fn environment_turn_budget_is_used_and_zero_is_rejected() {
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("invalid value '0'"));
     }
+}
+
+fn completion_run(repo: &Path, fixture: &Fixture, scenario: &str, args: &[&str]) -> std::process::Output {
+    let plan = tempfile::NamedTempFile::with_suffix(".md").unwrap();
+    std::fs::write(plan.path(), scenario).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+        .arg(plan.path()).arg("--repo").arg(repo)
+        .arg("--skills-dir").arg(repo.join(".git/fixture-skills"))
+        .arg("--base-url").arg(format!("http://{}", fixture.address))
+        .arg("--session-timeout").arg("20").args(args)
+        .env("HOME", repo).env("OPENCODE_GO_API_KEY", "fixture-key")
+        .output().unwrap()
+}
+
+#[test]
+fn reasoning_only_completion_continues_the_same_stage_session() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let output = completion_run(repo.path(), &fixture, "COMPLETION_RECOVER", &[]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(std::fs::read_to_string(repo.path().join("hello.txt")).unwrap(), "fixed\n");
+    let evidence = session_evidence(repo.path());
+    assert_eq!(evidence["continuation_count"], 1);
+    assert_eq!(evidence["runs"].as_array().unwrap().len(), 2);
+    assert_eq!(evidence["observed_turns"], 4);
+    let history = fixture.history.lock().unwrap();
+    let resumed = &history[2]["messages"];
+    assert!(resumed.as_array().unwrap().iter().any(|message| message["role"] == "tool"), "continuation lost prior research tool result");
+    assert_eq!(resumed.as_array().unwrap().iter().filter(|message| message["role"] == "user" && message.to_string().contains("COMPLETION_RECOVER")).count(), 1, "replayed original task");
+    assert!(!std::fs::read_to_string(run_artifacts(repo.path()).join("implement.txt")).unwrap().contains("Private fixture reasoning"));
+}
+
+#[test]
+fn empty_completion_has_a_bounded_continuation_budget() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let output = completion_run(repo.path(), &fixture, "COMPLETION_EMPTY", &[]);
+    assert!(!output.status.success());
+    assert_eq!(fixture.implementation_requests.load(Ordering::Relaxed), 3);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no final answer"));
+    let evidence = session_evidence(repo.path());
+    assert_eq!(evidence["continuation_count"], 2);
+    assert_eq!(evidence["status"], "failed");
+    assert_eq!(git(repo.path(), &["rev-list", "--count", "main..HEAD"]).trim(), "0");
+}
+
+#[test]
+fn continuation_does_not_reset_the_turn_budget() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let output = completion_run(repo.path(), &fixture, "COMPLETION_RECOVER", &["--max-turns", "3"]);
+    assert!(!output.status.success());
+    assert_eq!(fixture.implementation_requests.load(Ordering::Relaxed), 3);
+    let evidence = session_evidence(repo.path());
+    assert_eq!(evidence["observed_turns"], 3);
+    assert!(evidence["error"].as_str().unwrap().contains("turn limit"));
+}
+
+#[test]
+fn truncated_tools_and_filtered_responses_never_retry_or_execute_tools() {
+    for scenario in ["COMPLETION_TRUNCATED_TOOL", "COMPLETION_FILTERED"] {
+        let repo = repository();
+        let fixture = Fixture::start(repo.path(), false);
+        let output = completion_run(repo.path(), &fixture, scenario, &[]);
+        assert!(!output.status.success());
+        assert_eq!(fixture.implementation_requests.load(Ordering::Relaxed), 1);
+        assert!(!repo.path().join("unsafe.txt").exists());
+        assert_eq!(git(repo.path(), &["rev-list", "--count", "main..HEAD"]).trim(), "0");
+    }
+}
+
+#[test]
+fn length_without_tool_calls_can_continue_and_complete() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let output = completion_run(repo.path(), &fixture, "COMPLETION_LENGTH", &[]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(session_evidence(repo.path())["continuation_count"], 1);
+}
+
+#[test]
+fn explicit_blocker_preserves_its_explanation_and_never_commits() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let output = completion_run(repo.path(), &fixture, "COMPLETION_BLOCKED", &[]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("required fixture dependency is unavailable"));
+    assert_eq!(fixture.implementation_requests.load(Ordering::Relaxed), 1);
+    assert_eq!(git(repo.path(), &["rev-list", "--count", "main..HEAD"]).trim(), "0");
 }
