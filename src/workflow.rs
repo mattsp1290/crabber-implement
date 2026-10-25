@@ -311,8 +311,15 @@ impl Workflow {
                     "implementation changed branch or HEAD; refusing host commit"
                 );
                 ensure!(
-                    !text.trim().is_empty() && !text.contains("BLOCKED"),
-                    "implementation reported a blocker or no result"
+                    !text
+                        .trim_start()
+                        .strip_prefix("BLOCKED")
+                        .is_some_and(|tail| tail.is_empty()
+                            || tail.starts_with(
+                                |character: char| character.is_whitespace() || character == ':'
+                            )),
+                    "implementation reported a blocker: {}",
+                    text.trim()
                 );
                 ensure!(!ctx.cancel.is_cancelled(), "stage cancelled before commit");
                 git::commit_changes(&self.config.repo, "feat: implement supplied plan")?;

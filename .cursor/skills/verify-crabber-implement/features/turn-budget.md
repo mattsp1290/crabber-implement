@@ -22,3 +22,5 @@ Require the default-budget journey to make more than 64 model requests and compl
 The CLI does not configure a Datadog exporter. If authenticated `pup` searches find no matching run, inspect the local session records and tool transcripts.
 
 The CLI uses the sibling Crabber checkout's `AgentBuilder::max_turns` API. Update that checkout with the corresponding facade change before building. Increasing `--session-timeout` does not increase the turn budget. Increasing `--max-reviews` does not increase it either. A larger turn budget does not resume an already failed in-memory session. Commit or stash partial edits before starting a new invocation.
+
+Empty-answer continuations keep the same session history but admit a new model run with only the remaining turn allowance. The stage's cumulative count and original deadline do not reset. The separate continuation limit allows at most two additional prompts. Verify this with `continuation_does_not_reset_the_turn_budget` in the CLI fixture.

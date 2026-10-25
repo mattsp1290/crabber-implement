@@ -5,7 +5,7 @@ use std::{
     path::Path,
     process::Command,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
@@ -57,6 +57,7 @@ struct Fixture {
     stop: Arc<AtomicBool>,
     implementation_requests: Arc<AtomicUsize>,
     stream_release: Arc<AtomicBool>,
+    history: Arc<Mutex<Vec<Value>>>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -71,6 +72,8 @@ impl Fixture {
         let requests = implementation_requests.clone();
         let stream_release = Arc::new(AtomicBool::new(false));
         let release = stream_release.clone();
+        let history = Arc::new(Mutex::new(Vec::new()));
+        let histories = history.clone();
         let repo = repo.to_path_buf();
         let worker = thread::spawn(move || {
             let mut connections = Vec::new();
@@ -81,19 +84,27 @@ impl Fixture {
                         let requests = requests.clone();
                         let release = release.clone();
                         let stopped = stopped.clone();
+                        let histories = histories.clone();
                         connections.push(thread::spawn(move || {
                         stream.set_nonblocking(false).unwrap();
                         stream
                             .set_read_timeout(Some(Duration::from_secs(5)))
                             .unwrap();
                         let body = request(&mut stream);
+                        histories.lock().unwrap().push(body.clone());
                         let serialized = body.to_string();
                         let has_result = body["messages"]
                             .as_array()
                             .unwrap()
                             .iter()
                             .any(|message| message["role"] == "tool");
-                        let response = if serialized
+                        let response = if serialized.contains("Summarize this context for continuation") {
+                            if serialized.contains("COMPLETION_STREAM_VISIBLE") {
+                                text("COMPLETION_STREAM_VISIBLE The assigned task wrote hello.txt with initial greeting. Complete verification and report the result.")
+                            } else {
+                                text("COMPLETION_STREAM_HIDDEN Complete the assigned task by writing hello.txt with initial greeting, then report the result.")
+                            }
+                        } else if serialized
                             .contains("Perform your assigned independent review")
                         {
                             assert!(!serialized.contains("external-secret-sentinel"), "host followed a committed symlink outside the review snapshot");
@@ -116,6 +127,38 @@ impl Fixture {
                                     "file_edit",
                                     json!({"path":"hello.txt","anchor":"initial","replacement":"fixed"}),
                                 )
+                            }
+                        } else if serialized.contains("COMPLETION_") {
+                            let attempt = requests.fetch_add(1, Ordering::Relaxed);
+                            let continued = body["messages"].as_array().unwrap().iter().any(|message| message["role"] == "user" && !message["content"].to_string().contains("COMPLETION_"));
+                            if serialized.contains("COMPLETION_STREAM_VISIBLE") && attempt == 0 {
+                                tool("file_write", json!({"path":"hello.txt","content":"initial\n"}))
+                            } else if serialized.contains("COMPLETION_STREAM_HIDDEN") && attempt == 1 {
+                                json!({"choices":[{"index":0,"delta":{"reasoning_content":"Private retry reasoning."},"finish_reason":"stop"}]})
+                            } else if serialized.contains("COMPLETION_STREAM_HIDDEN") && attempt == 2 {
+                                tool("file_write", json!({"path":"hello.txt","content":"initial\n"}))
+                            } else if serialized.contains("COMPLETION_BLOCKED") {
+                                text("BLOCKED: The required fixture dependency is unavailable.")
+                            } else if serialized.contains("COMPLETION_TRUNCATED_TOOL") {
+                                let mut response = tool("file_write", json!({"path":"unsafe.txt","content":"must not run"}));
+                                response["choices"][0]["finish_reason"] = "length".into();
+                                response
+                            } else if serialized.contains("COMPLETION_FILTERED") {
+                                json!({"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]})
+                            } else if serialized.contains("COMPLETION_EMPTY") || serialized.contains("COMPLETION_DELAY") || serialized.contains("COMPLETION_CANCEL") || (serialized.contains("COMPLETION_RECOVER") && attempt == 1) {
+                                json!({"choices":[{"index":0,"delta":{"reasoning_content":"Private fixture reasoning."},"finish_reason":"stop"}]})
+                            } else if serialized.contains("COMPLETION_LENGTH") && !continued {
+                                json!({"choices":[{"index":0,"delta":{"content":"Partial narration"},"finish_reason":"length"}]})
+                            } else if serialized.contains("COMPLETION_RECOVER") && attempt == 0 {
+                                {
+                                    let mut response = tool("file_read", json!({"path":"README.md"}));
+                                    response["choices"][0]["delta"]["content"] = "Researching the fixture repository. ".into();
+                                    response
+                                }
+                            } else if !serialized.contains("hello.txt") {
+                                tool("file_write", json!({"path":"hello.txt","content":"initial\n"}))
+                            } else {
+                                text("Implemented the plan. The BLOCKED marker is documented in README.md.")
                             }
                         } else if serialized.contains("LONG_TURNS") {
                             requests.fetch_add(1, Ordering::Relaxed);
@@ -140,6 +183,14 @@ impl Fixture {
                                 json!({"path":"hello.txt","content":"initial\n"}),
                             )
                         };
+                        if (serialized.contains("COMPLETION_STREAM_HIDDEN") && requests.load(Ordering::Relaxed) == 1 && !serialized.contains("Summarize this context for continuation"))
+                            || (serialized.contains("COMPLETION_STREAM_VISIBLE") && requests.load(Ordering::Relaxed) == 2 && !serialized.contains("Summarize this context for continuation")) {
+                            let partial = json!({"choices":[{"index":0,"delta":{"content":"BLOCKED: stale failed response. "},"finish_reason":null}]});
+                            let error = json!({"error":{"code":400,"message":"fixture overflow","metadata":{"error_type":"context_length_exceeded"}}});
+                            let payload = format!("data: {partial}\n\ndata: {error}\n\n");
+                            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload).unwrap();
+                            return;
+                        }
                         if has_result && serialized.contains("LIVE_ARTIFACTS")
                             && !serialized.contains("Perform your assigned independent review")
                             && !serialized.contains("Execute the following fix-review skill") {
@@ -152,6 +203,15 @@ impl Fixture {
                             }
                             if !stopped.load(Ordering::Relaxed) {
                                 stream.write_all(last.as_bytes()).unwrap();
+                            }
+                            return;
+                        }
+                        if serialized.contains("COMPLETION_DELAY") {
+                            thread::sleep(Duration::from_millis(if requests.load(Ordering::Relaxed) == 1 { 900 } else { 2500 }));
+                        }
+                        if serialized.contains("COMPLETION_CANCEL") && requests.load(Ordering::Relaxed) > 1 {
+                            while !stopped.load(Ordering::Relaxed) {
+                                thread::sleep(Duration::from_millis(10));
                             }
                             return;
                         }
@@ -174,6 +234,7 @@ impl Fixture {
             stop,
             implementation_requests,
             stream_release,
+            history,
             worker: Some(worker),
         }
     }
@@ -220,7 +281,7 @@ fn request(stream: &mut TcpStream) -> Value {
 }
 
 fn text(content: &str) -> Value {
-    json!({"choices":[{"index":0,"delta":{"content":content},"finish_reason":"stop"}]})
+    json!({"choices":[{"index":0,"delta":{"content":content},"finish_reason":"stop"}],"usage":{"prompt_tokens":17,"completion_tokens":3}})
 }
 
 fn tool(name: &str, arguments: Value) -> Value {
@@ -672,6 +733,26 @@ fn default_turn_budget_allows_more_than_64_model_turns() {
     );
     assert!(evidence["run_id"].as_str().is_some_and(|id| !id.is_empty()));
     assert!(evidence["error"].is_null());
+    assert_eq!(evidence["runs"][0]["response_count"], 66);
+    assert_eq!(evidence["runs"][0]["responses_truncated"], true);
+    assert_eq!(
+        evidence["runs"][0]["responses"].as_array().unwrap().len(),
+        8
+    );
+    let artifacts = run_artifacts(repo.path());
+    assert!(
+        std::fs::metadata(artifacts.join("implement.session.json"))
+            .unwrap()
+            .len()
+            < 65_536
+    );
+    let responses = std::fs::read_to_string(artifacts.join("implement.responses.jsonl")).unwrap();
+    assert_eq!(responses.lines().count(), 66);
+    for line in responses.lines() {
+        let response: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(response["run_id"], evidence["run_id"]);
+        assert!(response["stream_completed"].as_bool().unwrap());
+    }
 }
 
 #[test]
@@ -729,5 +810,300 @@ fn environment_turn_budget_is_used_and_zero_is_rejected() {
             .unwrap();
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("invalid value '0'"));
+    }
+}
+
+fn completion_run(
+    repo: &Path,
+    fixture: &Fixture,
+    scenario: &str,
+    args: &[&str],
+) -> std::process::Output {
+    let plan = tempfile::NamedTempFile::with_suffix(".md").unwrap();
+    std::fs::write(plan.path(), scenario).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_crabber-implement"));
+    if !args.contains(&"--session-timeout") {
+        command.args(["--session-timeout", "20"]);
+    }
+    command
+        .arg(plan.path())
+        .arg("--repo")
+        .arg(repo)
+        .arg("--skills-dir")
+        .arg(repo.join(".git/fixture-skills"))
+        .arg("--base-url")
+        .arg(format!("http://{}", fixture.address))
+        .args(args)
+        .env("OPENCODE_GO_API_KEY", "fixture-key")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn reasoning_only_completion_continues_the_same_stage_session() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let output = completion_run(repo.path(), &fixture, "COMPLETION_RECOVER", &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("hello.txt")).unwrap(),
+        "fixed\n"
+    );
+    let evidence = session_evidence(repo.path());
+    assert_eq!(evidence["continuation_count"], 1);
+    assert_eq!(evidence["runs"].as_array().unwrap().len(), 2);
+    assert_eq!(evidence["observed_turns"], 4);
+    assert_eq!(evidence["runs"][0]["responses"][1]["finish_reason"], "stop");
+    assert_eq!(
+        evidence["runs"][0]["responses"][1]["has_visible_text"],
+        false
+    );
+    assert_eq!(
+        evidence["runs"][0]["responses"][1]["stream_completed"],
+        true
+    );
+    assert_eq!(
+        evidence["runs"][1]["responses"][1]["usage"]["input_tokens"],
+        17
+    );
+    assert_ne!(evidence["runs"][0]["run_id"], evidence["runs"][1]["run_id"]);
+    export_artifacts(&run_artifacts(repo.path()), "completion");
+    let history = fixture.history.lock().unwrap();
+    let resumed = &history[2]["messages"];
+    assert_eq!(
+        resumed
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .count(),
+        2,
+        "continuation prompt missing from same-session history"
+    );
+    assert!(
+        resumed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "tool"),
+        "continuation lost prior research tool result"
+    );
+    assert_eq!(
+        resumed
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "user"
+                && message.to_string().contains("COMPLETION_RECOVER"))
+            .count(),
+        1,
+        "replayed original task"
+    );
+    assert!(
+        !std::fs::read_to_string(run_artifacts(repo.path()).join("implement.txt"))
+            .unwrap()
+            .contains("Private fixture reasoning")
+    );
+}
+
+#[test]
+fn empty_completion_has_a_bounded_continuation_budget() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let output = completion_run(repo.path(), &fixture, "COMPLETION_EMPTY", &[]);
+    assert!(!output.status.success());
+    assert_eq!(fixture.implementation_requests.load(Ordering::Relaxed), 3);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no final answer"));
+    let evidence = session_evidence(repo.path());
+    assert_eq!(evidence["continuation_count"], 2);
+    assert_eq!(evidence["status"], "failed");
+    assert_eq!(
+        git(repo.path(), &["rev-list", "--count", "main..HEAD"]).trim(),
+        "0"
+    );
+}
+
+#[test]
+fn continuation_does_not_reset_the_turn_budget() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let output = completion_run(
+        repo.path(),
+        &fixture,
+        "COMPLETION_RECOVER",
+        &["--max-turns", "3"],
+    );
+    assert!(!output.status.success());
+    assert_eq!(fixture.implementation_requests.load(Ordering::Relaxed), 3);
+    let evidence = session_evidence(repo.path());
+    assert_eq!(evidence["observed_turns"], 3);
+    assert!(evidence["error"].as_str().unwrap().contains("turn limit"));
+}
+
+#[test]
+fn truncated_tools_and_filtered_responses_never_retry_or_execute_tools() {
+    for scenario in ["COMPLETION_TRUNCATED_TOOL", "COMPLETION_FILTERED"] {
+        let repo = repository();
+        let fixture = Fixture::start(repo.path(), false);
+        let output = completion_run(repo.path(), &fixture, scenario, &[]);
+        assert!(!output.status.success());
+        assert_eq!(fixture.implementation_requests.load(Ordering::Relaxed), 1);
+        assert!(!repo.path().join("unsafe.txt").exists());
+        assert_eq!(
+            git(repo.path(), &["rev-list", "--count", "main..HEAD"]).trim(),
+            "0"
+        );
+    }
+}
+
+#[test]
+fn length_without_tool_calls_can_continue_and_complete() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let output = completion_run(repo.path(), &fixture, "COMPLETION_LENGTH", &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(session_evidence(repo.path())["continuation_count"], 1);
+}
+
+#[test]
+fn explicit_blocker_preserves_its_explanation_and_never_commits() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let output = completion_run(repo.path(), &fixture, "COMPLETION_BLOCKED", &[]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("required fixture dependency is unavailable")
+    );
+    assert_eq!(fixture.implementation_requests.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        git(repo.path(), &["rev-list", "--count", "main..HEAD"]).trim(),
+        "0"
+    );
+}
+
+#[test]
+fn continuations_share_one_absolute_deadline() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let output = completion_run(
+        repo.path(),
+        &fixture,
+        "COMPLETION_DELAY",
+        &["--session-timeout", "3"],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("exceeded 3 seconds"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.implementation_requests.load(Ordering::Relaxed), 2);
+    let evidence = session_evidence(repo.path());
+    assert_eq!(evidence["continuation_count"], 1);
+    assert_eq!(evidence["status"], "failed");
+}
+
+#[test]
+fn cancellation_during_continuation_never_replays_the_stage() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let plan = tempfile::NamedTempFile::with_suffix(".md").unwrap();
+    std::fs::write(plan.path(), "COMPLETION_CANCEL").unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+        .arg(plan.path())
+        .arg("--repo")
+        .arg(repo.path())
+        .arg("--skills-dir")
+        .arg(repo.path().join(".git/fixture-skills"))
+        .arg("--base-url")
+        .arg(format!("http://{}", fixture.address))
+        .arg("--session-timeout")
+        .arg("20")
+        .env("OPENCODE_GO_API_KEY", "fixture-key")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until(|| fixture.implementation_requests.load(Ordering::Relaxed) == 2);
+    let recovering = session_evidence(repo.path());
+    assert_eq!(recovering["status"], "running");
+    assert_eq!(recovering["continuation_count"], 1);
+    assert_eq!(recovering["runs"].as_array().unwrap().len(), 2);
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(fixture.implementation_requests.load(Ordering::Relaxed), 2);
+    assert_eq!(session_evidence(repo.path())["status"], "failed");
+    assert_eq!(
+        git(repo.path(), &["rev-list", "--count", "main..HEAD"]).trim(),
+        "0"
+    );
+}
+
+#[test]
+fn failed_stream_text_cannot_become_the_final_answer() {
+    for (scenario, continuations) in [
+        ("COMPLETION_STREAM_HIDDEN", 1),
+        ("COMPLETION_STREAM_VISIBLE", 0),
+    ] {
+        let repo = repository();
+        let fixture = Fixture::start(repo.path(), false);
+        let output = completion_run(repo.path(), &fixture, scenario, &[]);
+        assert!(
+            output.status.success(),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("hello.txt")).unwrap(),
+            "fixed\n"
+        );
+        assert_eq!(
+            session_evidence(repo.path())["continuation_count"],
+            continuations
+        );
+        if scenario == "COMPLETION_STREAM_HIDDEN" {
+            let history = fixture.history.lock().unwrap();
+            let resumed = history
+                .iter()
+                .filter(|request| {
+                    !request
+                        .to_string()
+                        .contains("Summarize this context for continuation")
+                })
+                .nth(2)
+                .unwrap();
+            assert!(
+                resumed["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message["role"] == "user"
+                        && message["content"]
+                            .to_string()
+                            .contains("Continue the assigned task from the existing session")),
+                "compaction omitted the continuation nudge"
+            );
+        }
+        assert!(
+            std::fs::read_to_string(run_artifacts(repo.path()).join("implement.txt"))
+                .unwrap()
+                .contains("stale failed response")
+        );
     }
 }
