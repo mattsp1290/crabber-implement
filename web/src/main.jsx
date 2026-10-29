@@ -32,12 +32,15 @@ const sessionNode = (name) =>
     : name.startsWith("fix-review-")
       ? "fix-review"
       : "review";
-const sessionLabel = (name) =>
+const legacySessionLabel = (name) =>
   name === "implement"
     ? "Implementation agent"
     : name.startsWith("fix-review-")
       ? `Fix agent · round ${name.match(/\d+/)?.[0]}`
       : `${name.endsWith("maintainability") ? "Maintainability" : "Correctness"} · round ${name.match(/\d+/)?.[0]}`;
+const sessionLabel = (session) => session.reviewRole
+  ? `${session.reviewRole === "correctness" ? "Correctness" : "Maintainability"} · round ${session.reviewRound} · attempt ${session.reviewAttempt}${session.reused ? " · Reused" : ""}`
+  : legacySessionLabel(session.name);
 const repoName = (repo) =>
   repo?.replace(/\/$/, "").split("/").at(-1) ?? "Archived run";
 
@@ -258,7 +261,7 @@ function SessionDetail({ run, node }) {
                 onClick={() => setSessionName(session.name)}
               >
                 <span className={`status-dot ${session.status}`} />
-                {sessionLabel(session.name)}
+                {sessionLabel(session)}
               </button>
             ))}
           </div>
@@ -540,6 +543,15 @@ function App() {
                   <code>{run.id}</code>
                   <span>{run.model ?? "Model unavailable"}</span>
                 </div>
+                {run.recoveryMode === "refresh" && (
+                  <p data-testid="refresh-lineage">
+                    Refreshed from{" "}
+                    <a href={`/?run=${run.parentWorkflowId}`} onClick={(event) => {
+                      event.preventDefault();
+                      selectRun(run.parentWorkflowId);
+                    }}>{run.parentWorkflowId}</a>. Review round {run.reviewRound}.
+                  </p>
+                )}
               </div>
               <Badge status={run.status} />
             </div>

@@ -14,7 +14,7 @@ cargo build --locked
 ./target/debug/crabber-implement --help
 ```
 
-The executable prints `Usage: crabber-implement [OPTIONS] <PLAN>`. Each invocation exits when its workflow finishes. The React monitor is a separate process. It requires Git and ripgrep 14 or later. The live provider requires `OPENCODE_GO_API_KEY` in the environment. The CLI does not source `~/.profile`.
+The executable prints `Usage: crabber-implement [OPTIONS] <PLAN>`. Help lists `--max-output-tokens` with default 16384 and `--max-recovery-output-tokens` with default 65536. Verify cap-dependent escalation and bounded exhaustion through `features/completion.md`. Each invocation exits when its workflow finishes. The React monitor is a separate process. It requires Git and ripgrep 14 or later. The live provider requires `OPENCODE_GO_API_KEY` in the environment. The CLI does not source `~/.profile`.
 
 ## Doctor
 
@@ -67,3 +67,11 @@ python3 -c 'from pathlib import Path; assert Path(".audit/live/result.json").is_
 ```
 
 Each live invocation costs provider usage. Do not rerun the live journey solely because documentation changed. Update this skill and its feature map when behavior changes. Use `/maintain-verification-skill` for a dedicated maintenance pass.
+
+Fix sessions use the bundled autonomous policy. Verify sensitive-source auto-fixes and genuine blockers through `features/workflow.md`; the external skills directory needs only `review/SKILL.md`.
+
+Datadog APM traces default to the loopback agent receiver. Follow `features/telemetry.md` for credential-free wire assertions and an explicit local-agent delivery check. Use `--no-telemetry` for manual runs that must not export.
+
+For checkpoint, resume, reviewer identity or rendering changes, run [review recovery](features/review-recovery.md). Preserve the same binary throughout each two-process journey; do not run source mutation checks concurrently with browser or CLI recovery tests.
+
+For final reviewer prompts, snapshots, artifact tools, or input caps, run [bounded review inputs](features/bounded-review-inputs.md). For an upgraded executable, use the explicit refresh journey in [review recovery](features/review-recovery.md). Normal invocation, strict resume, and refresh have separate acceptance checks. Never run source mutations while a browser or strict-resume journey depends on an unchanged executable.

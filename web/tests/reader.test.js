@@ -213,3 +213,86 @@ test("UTF-8 tails omit leading continuation bytes", async (t) => {
   assert.ok(!run.sessions[0].text.content.includes("�"));
   assert.ok(run.sessions[0].text.content.endsWith("abc"));
 });
+
+test("output exhaustion survives extra budget evidence", async (t) => {
+  const { put, reader } = await fixture(t);
+  const error = "Session implement exhausted its output ceiling at requested cap 65536; partial edits are preserved";
+  await put("run.json", metadata);
+  await put("stages.jsonl", JSON.stringify(event("implement", 1, "started")) + "\n");
+  await put("result.json", { status: "failed", error });
+  await put("implement.session.json", {
+    name: "implement", status: "failed", error,
+    max_output_tokens: 16384, max_recovery_output_tokens: 65536,
+    runs: [{ requested_max_output_tokens: 65536, continuation_cause: "output_limit", status: "failed" }],
+  });
+  const snapshot = await reader.snapshot(ID);
+  assert.equal(snapshot.status, "failed");
+  assert.equal(snapshot.sessions[0].status, "failed");
+  assert.equal(snapshot.sessions[0].error, error);
+  assert.deepEqual(snapshot.warnings, []);
+});
+
+test("resumed generation ignores old terminal result and prioritizes current role attempts", async (t) => {
+  const { put, reader } = await fixture(t);
+  await put("run.json", { ...metadata, version: 2, execution_generation: 2 });
+  await put("result.json", { status: "failed", error: "previous execution failed", execution_generation: 1 });
+  await put("stages.jsonl", JSON.stringify(event("review", 1, "started")) + "\n");
+  await put("review-state.json", { version: 1, workflow_id: ID, generation: 2, round: 1, phase: "review_pending", attempts: [1,2], reused: [true,false], inputs: { private: "PRIVATE_PROMPT" } });
+  for (const [role,attempt,status] of [["correctness",1,"completed"],["maintainability",2,"running"]]) {
+    const name = `review-1-${role}-attempt-${attempt}`;
+    await put(`${name}.session.json`, { name, status, review_round: 1, review_role: role, review_attempt: attempt, execution_generation: role === "correctness" ? 1 : 2 });
+    await put(`${name}.txt`, "review evidence");
+  }
+  await put("review-1-maintainability-attempt-1.session.json", { name: "review-1-maintainability-attempt-1", status: "running", execution_generation: 1 });
+  let snapshot = await reader.snapshot(ID);
+  assert.equal(snapshot.status,"running");
+  assert.equal(snapshot.error,null);
+  assert.equal(snapshot.sessions.find(s => s.name === "review-1-maintainability-attempt-1").status, "unknown");
+  assert.equal(snapshot.sessions.find(s=>s.reviewRole === "correctness").reused,true);
+  assert.equal(snapshot.sessions.find(s=>s.reviewRole === "maintainability").reviewAttempt,2);
+  assert.equal(JSON.stringify(snapshot).includes("PRIVATE_PROMPT"),false);
+  await put("result.json", { status: "completed", error: null, execution_generation: 2 });
+  snapshot = await reader.snapshot(ID);
+  assert.equal(snapshot.status,"completed");
+});
+
+test("refresh lineage keeps the failed parent separate and both reviewers fresh at round four", async (t) => {
+  const { root, put, reader } = await fixture(t);
+  const parent = "22222222-2222-4222-8222-222222222222";
+  await mkdir(path.join(root, parent));
+  await writeFile(path.join(root, parent, "run.json"), JSON.stringify({ ...metadata, run_id: parent }));
+  await writeFile(path.join(root, parent, "result.json"), JSON.stringify({ status: "failed", error: "admission proof exhausted" }));
+  await put("run.json", { ...metadata, version: 2, execution_generation: 1, parent_workflow_id: parent, recovery_mode: "refresh", review_round: 4 });
+  await put("review-state.json", { version: 2, workflow_id: ID, generation: 1, round: 4, phase: "review_pending", attempts: [1, 1], reused: [false, false] });
+  await put("stages.jsonl", JSON.stringify(event("review", 4, "started")) + "\n");
+  for (const role of ["correctness", "maintainability"]) {
+    const name = `review-4-${role}-attempt-1`;
+    await put(`${name}.session.json`, { name, execution_generation: 1, review_round: 4, review_role: role, review_attempt: 1, status: "running" });
+  }
+  const run = await reader.snapshot(ID);
+  assert.equal(run.parentWorkflowId, parent);
+  assert.equal(run.recoveryMode, "refresh");
+  assert.equal(run.reviewRound, 4);
+  assert.equal(run.sessions.length, 2);
+  assert.ok(run.sessions.every((session) => session.reviewRound === 4 && session.reviewAttempt === 1 && !session.reused));
+  assert.equal((await reader.snapshot(parent)).status, "failed");
+  assert.equal((await reader.list()).runs.length, 2);
+  assert.ok(!JSON.stringify(run).includes("inputs"));
+});
+
+test("invalid or incomplete refresh lineage is never projected", async (t) => {
+  const { put, reader } = await fixture(t);
+  for (const fields of [
+    { parent_workflow_id: "../../private", recovery_mode: "refresh", review_round: 4 },
+    { parent_workflow_id: ID, recovery_mode: "refresh", review_round: 4 },
+    { parent_workflow_id: "22222222-2222-4222-8222-222222222222" },
+    { parent_workflow_id: "22222222-2222-4222-8222-222222222222", recovery_mode: "refresh", review_round: 0 },
+    { recovery_mode: "refresh", review_round: 4 },
+  ]) {
+    await put("run.json", { ...metadata, ...fields });
+    const run = await reader.snapshot(ID);
+    assert.equal(run.parentWorkflowId, null);
+    assert.equal(run.recoveryMode, null);
+    assert.ok(run.warnings.some((warning) => warning.includes("run.json")));
+  }
+});
