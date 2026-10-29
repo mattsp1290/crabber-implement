@@ -8,18 +8,25 @@ license = "MIT"
 anyhow = "1"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
-crabber = { path = "../crabber/crates/crabber", features = ["opencode-go"] }
+crabber = { path = "../crabber/crates/crabber", features = ["opencode-go", "otlp"] }
 crabber-tools-catalog = { path = "../crabber/crates/crabber-tools-catalog" }
 dmt = { git = "https://github.com/mattsp1290/dmt", rev = "f7f4e5f564939a729b37f230c427aabc8bdbdb66" }
 flows-api = { path = "../dmt-flows/crates/flows-api" }
 flows-core = { path = "../dmt-flows/crates/flows-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "process", "io-util", "net"] }
 uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 
 [dev-dependencies]
 tempfile = "3"
+prost = "0.14"
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "trace"] }
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -29,3 +36,9 @@ debug = 0
 
 [profile.test]
 debug = 0
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.test.package.sha2]
+opt-level = 3

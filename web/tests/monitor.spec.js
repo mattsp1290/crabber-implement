@@ -322,3 +322,53 @@ test("an unavailable run URL still exposes valid runs for recovery", async ({
   );
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
+
+test("output exhaustion shows the specific cause on a failed stage", async ({ page }, testInfo) => {
+  const error = "Session implement exhausted its output ceiling at requested cap 65536; partial edits are preserved";
+  await stage("implement", 1, "started");
+  await put("implement.session.json", {
+    name: "implement", status: "failed", error,
+    max_output_tokens: 16384, max_recovery_output_tokens: 65536,
+    runs: [{ requested_max_output_tokens: 65536, continuation_cause: "output_limit", status: "failed" }],
+  });
+  await put("result.json", { status: "failed", error });
+  await page.goto(`/?run=${id}`);
+  await expect(page.getByTestId("current-node")).toHaveText("Implement");
+  await expect(page.getByText(error).first()).toBeVisible();
+  await expect(page.locator(".session-meta")).toContainText("Failed");
+  await page.screenshot({ path: testInfo.outputPath("output-exhaustion.png"), fullPage: true });
+});
+
+test("a refreshed round-four run links to its failed parent and starts two fresh reviewers", async ({ page }, testInfo) => {
+  clearInterval(heartbeat);
+  const parent = randomUUID();
+  const parentDir = path.join(root, parent);
+  await mkdir(parentDir);
+  try {
+    await writeFile(path.join(parentDir, "run.json"), JSON.stringify({ ...metadata(), run_id: parent }));
+    await writeFile(path.join(parentDir, "result.json"), JSON.stringify({ status: "failed", error: "Admission proof budget exhausted." }));
+    await put("run.json", { ...metadata(), version: 2, execution_generation: 1, parent_workflow_id: parent, recovery_mode: "refresh", review_round: 4 });
+    await put("review-state.json", { version: 2, workflow_id: id, generation: 1, round: 4, phase: "review_pending", attempts: [1, 1], reused: [false, false] });
+    await stage("review", 4, "started");
+    for (const role of ["correctness", "maintainability"]) {
+      const name = `review-4-${role}-attempt-1`;
+      await put(`${name}.session.json`, { name, execution_generation: 1, review_round: 4, review_role: role, review_attempt: 1, status: "running" });
+      await put(`${name}.txt`, "Inspecting omitted immutable evidence.");
+    }
+    await page.goto(`/?run=${id}`);
+    await expect(page.getByTestId("refresh-lineage")).toContainText("Review round 4.");
+    await page.getByTestId("node-review").click();
+    await expect(page.getByRole("button", { name: /Correctness.*round 4.*attempt 1/ })).toBeVisible();
+    await expect(page.getByRole("button", { name: /Maintainability.*round 4.*attempt 1/ })).toBeVisible();
+    await expect(page.getByText(/Reused/, { exact: false })).toHaveCount(0);
+    await page.screenshot({ path: testInfo.outputPath("refresh-round-four.png"), fullPage: true });
+    await put("result.json", { status: "completed", execution_generation: 1 });
+    await expect(page.getByTestId("run-status")).toHaveAttribute("data-status", "completed");
+    await page.getByTestId("refresh-lineage").getByRole("link", { name: parent }).click();
+    await expect(page.getByTestId("run-status")).toHaveAttribute("data-status", "failed");
+    await expect(page.getByRole("alert")).toContainText("Admission proof budget exhausted.");
+    await page.screenshot({ path: testInfo.outputPath("refresh-parent-failure.png"), fullPage: true });
+  } finally {
+    await rm(parentDir, { recursive: true, force: true });
+  }
+});
