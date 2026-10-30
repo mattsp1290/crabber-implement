@@ -122,7 +122,7 @@ impl BoundedFixture {
                                 let round: u32 = prompt.strip_prefix("Review round ").unwrap().split('.').next().unwrap().parse().unwrap();
                                 let bounded = body["tools"].as_array().unwrap().iter().any(|tool| tool["function"]["name"] == "review_artifact_read");
                                 if bounded {
-                                    for message in body["messages"].as_array().unwrap().iter().filter(|message| message["role"] == "tool") {
+                                    for message in body["input"].as_array().unwrap().iter().filter(|message| message["type"] == "function_call_output") {
                                         let bytes = serde_json::to_vec(message).unwrap().len();
                                         assert!(bytes <= 32 * 1024, "provider-facing artifact tool message exceeds 32 KiB: {bytes}");
                                         let mut observations = seen.lock().unwrap();
@@ -195,7 +195,7 @@ impl BoundedFixture {
                                 }
                                 batch(calls)
                             };
-                            let payload = format!("data: {response}\n\ndata: [DONE]\n\n");
+                            let payload = responses_sse(&response);
                             let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload);
                         }));
                     }
@@ -221,7 +221,7 @@ impl BoundedFixture {
         }
     }
     fn command(&self, binary: &Path, repo: &Path, plan: &Path, skills: &Path) -> Command {
-        let mut command = Command::new(binary);
+        let mut command = fixture_command(binary);
         command
             .arg(plan)
             .arg("--repo")
@@ -231,7 +231,6 @@ impl BoundedFixture {
             .arg("--base-url")
             .arg(format!("http://{}", self.address))
             .args(["--session-timeout", "90", "--max-reviews", "4"])
-            .env("OPENCODE_GO_API_KEY", "bounded-fixture-key")
             .env("CRABBER_IMPLEMENT_NO_TELEMETRY", "true");
         command
     }
@@ -292,6 +291,7 @@ fn plan_file() -> tempfile::NamedTempFile {
     plan
 }
 fn check_bounded_run(fixture: &BoundedFixture, artifacts: &Path) {
+    responses::assert_native_delegations(artifacts, 8);
     let observations = fixture.observations.lock().unwrap();
     assert_eq!(observations.mutable_sessions, 4);
     assert_eq!(observations.evidence_reads, 8);
@@ -443,16 +443,14 @@ fn refresh_at_last_round_requires_fresh_reports_and_cannot_fix() {
         let original = file_inventory(&source);
         let head = git(repo.path(), &["rev-parse", "HEAD"]);
         if !changes {
-            let no_credentials = fixture
-                .command(binary, repo.path(), plan.path(), &skills)
+            let mut command = fixture.command(binary, repo.path(), plan.path(), &skills);
+            remove_auth(&mut command);
+            let no_credentials = command
                 .args(["--refresh-review", state["workflow_id"].as_str().unwrap()])
-                .env_remove("OPENCODE_GO_API_KEY")
                 .output()
                 .unwrap();
             assert!(!no_credentials.status.success());
-            assert!(
-                String::from_utf8_lossy(&no_credentials.stderr).contains("OPENCODE_GO_API_KEY")
-            );
+            assert!(String::from_utf8_lossy(&no_credentials.stderr).contains("codex login"));
             assert_eq!(runs(repo.path()).len(), 1);
             let changed_budget = fixture
                 .command(binary, repo.path(), plan.path(), &skills)
@@ -657,7 +655,7 @@ fn wait_marker(path: &Path) {
 }
 
 #[test]
-#[ignore = "actual previous executable refresh and browser-controlled lifecycle"]
+#[ignore = "browser-controlled refresh lifecycle"]
 fn cli_review_refresh_browser_journey() {
     let export = PathBuf::from(std::env::var_os("CRABBER_VERIFY_ARTIFACTS").unwrap());
     let continue_file =
@@ -666,23 +664,13 @@ fn cli_review_refresh_browser_journey() {
         PathBuf::from(std::env::var_os("CRABBER_VERIFY_REFRESH_RELEASE_FILE").unwrap());
     let done_file = PathBuf::from(std::env::var_os("CRABBER_VERIFY_REFRESH_DONE_FILE").unwrap());
     let binary = Path::new(env!("CARGO_BIN_EXE_crabber-implement"));
-    let legacy = std::env::var_os("CRABBER_VERIFY_LEGACY_BINARY").map(PathBuf::from);
     let repo = repository();
     let fixture = BoundedFixture::start(repo.path());
     let plan = plan_file();
     let skills = repo.path().join(".git/fixture-skills");
-    if legacy.is_none() {
-        fixture.fail_round.store(4, Ordering::Relaxed);
-    } else {
-        fixture.output_calls.store(9, Ordering::Relaxed);
-    }
+    fixture.fail_round.store(4, Ordering::Relaxed);
     let first = fixture
-        .command(
-            legacy.as_deref().unwrap_or(binary),
-            repo.path(),
-            plan.path(),
-            &skills,
-        )
+        .command(binary, repo.path(), plan.path(), &skills)
         .output()
         .unwrap();
     assert!(
@@ -698,26 +686,8 @@ fn cli_review_refresh_browser_journey() {
         "source failed before round4: {}",
         String::from_utf8_lossy(&first.stderr)
     );
-    if legacy.is_some() {
-        assert_eq!(state["version"], 1);
-        assert!(
-            String::from_utf8_lossy(&first.stderr).contains("proof-byte allowance exhausted"),
-            "{}",
-            String::from_utf8_lossy(&first.stderr)
-        );
-    }
     let original = file_inventory(&source);
     let head = git(repo.path(), &["rev-parse", "HEAD"]);
-    if legacy.is_some() {
-        let strict = fixture
-            .command(binary, repo.path(), plan.path(), &skills)
-            .args(["--resume-review", state["workflow_id"].as_str().unwrap()])
-            .output()
-            .unwrap();
-        assert!(!strict.status.success());
-        assert_eq!(file_inventory(&source), original);
-        assert_eq!(runs(repo.path()).len(), 1);
-    }
     export_artifacts(&source, "refresh-browser-source-failed");
     wait_marker(&continue_file);
     fixture.fail_round.store(0, Ordering::Relaxed);
@@ -763,35 +733,6 @@ fn cli_review_refresh_browser_journey() {
     assert_eq!(record(&child.join("review-state.json"))["round"], 4);
     export_artifacts(&child, "refresh-browser-completed");
     wait_marker(&done_file);
-}
-
-#[test]
-#[ignore = "requires the preserved pre-bounded executable"]
-fn legacy_large_prompt_fixture_calibration() {
-    let legacy = PathBuf::from(std::env::var_os("CRABBER_VERIFY_LEGACY_BINARY").unwrap());
-    let repo = repository();
-    let fixture = BoundedFixture::start(repo.path());
-    let plan = plan_file();
-    fixture.output_calls.store(9, Ordering::Relaxed);
-    let output = fixture
-        .command(
-            &legacy,
-            repo.path(),
-            plan.path(),
-            &repo.path().join(".git/fixture-skills"),
-        )
-        .output()
-        .unwrap();
-    let source = runs(repo.path()).pop().unwrap();
-    println!(
-        "legacy stdout {} stderr {} state {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-        record(&source.join("review-state.json"))
-    );
-    assert!(!output.status.success());
-    assert_eq!(record(&source.join("review-state.json"))["round"], 4);
-    export_artifacts(&source, "legacy-large-prompt-failed");
 }
 
 #[test]

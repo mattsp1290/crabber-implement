@@ -7,8 +7,11 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+base64 = "0.22"
+futures-util = "0.3"
+crabber-extensions = { path = "../crabber/crates/crabber-extensions" }
 clap = { version = "4", features = ["derive", "env"] }
-crabber = { path = "../crabber/crates/crabber", features = ["opencode-go", "otlp"] }
+crabber = { path = "../crabber/crates/crabber", features = ["codex", "otlp"] }
 crabber-tools-catalog = { path = "../crabber/crates/crabber-tools-catalog" }
 dmt = { git = "https://github.com/mattsp1290/dmt", rev = "f7f4e5f564939a729b37f230c427aabc8bdbdb66" }
 flows-api = { path = "../dmt-flows/crates/flows-api" }

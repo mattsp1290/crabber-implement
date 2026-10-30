@@ -1,10 +1,6 @@
 use super::*;
-use crate::config::{OutputBudget, PlanBundle};
-use std::{
-    num::{NonZeroU32, NonZeroUsize},
-    process::Command,
-    time::Duration,
-};
+use crate::config::PlanBundle;
+use std::{num::NonZeroUsize, process::Command, time::Duration};
 
 pub(crate) fn fixture() -> (tempfile::TempDir, RunConfig) {
     let temp = tempfile::tempdir().unwrap();
@@ -38,15 +34,13 @@ pub(crate) fn fixture() -> (tempfile::TempDir, RunConfig) {
         },
         review_skill: "review".into(),
         base: "main".into(),
-        model: "fixture".into(),
+        model: crate::config::MODEL.into(),
+        reasoning_effort: crabber::ReasoningEffort::Medium,
+        codex_auth_file: repo.join(".git/fixture-auth.json"),
         base_url: "http://127.0.0.1".into(),
         max_reviews: 3,
         max_turns: NonZeroUsize::new(20).unwrap(),
         session_timeout: Duration::from_secs(30),
-        output_budget: OutputBudget {
-            initial: NonZeroU32::new(16384).unwrap(),
-            ceiling: NonZeroU32::new(65536).unwrap(),
-        },
         artifacts,
         run_id,
         _repo_lock: fs::File::open(repo.join("README.md")).unwrap(),
@@ -453,4 +447,29 @@ fn killed_refresh_initialization_never_promotes_partial_inputs_or_reuses_old_rep
         }
         git::require_clean(&config.repo).unwrap();
     }
+}
+
+#[test]
+fn formal_legacy_checkpoint_versions_are_rejected() {
+    let (_temp, config) = fixture();
+    let checkpoint = state(&config);
+    for version in [1, 2] {
+        let mut wire = serde_json::to_value(&checkpoint).unwrap();
+        wire["version"] = version.into();
+        durable::write_json(&config.artifacts.join("review-state.json"), &wire, true).unwrap();
+        let rejected = ReviewCheckpoint::load(&config.artifacts)
+            .err()
+            .is_some_and(|error| {
+                error
+                    .to_string()
+                    .contains("only Codex native-subagent checkpoints")
+            });
+        assert!(
+            rejected,
+            "legacy checkpoint accepted as native subagent recovery"
+        );
+        assert!(RefreshSource::load(&config, &config.artifacts).is_err());
+    }
+    checkpoint.persist(&config.artifacts).unwrap();
+    assert!(ReviewCheckpoint::load(&config.artifacts).is_ok());
 }

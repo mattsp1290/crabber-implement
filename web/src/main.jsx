@@ -269,6 +269,7 @@ function SessionDetail({ run, node }) {
             <>
               <div className="session-meta">
                 <code>{selected.name}</code>
+                {selected.parentDelegation && <span>Crabber subagent</span>}
                 <span>
                   {selected.observedTurns !== null
                     ? `${selected.observedTurns} / ${selected.maxTurns ?? "?"} turns`

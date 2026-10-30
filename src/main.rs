@@ -1,4 +1,6 @@
 mod agent;
+mod codex_auth;
+mod codex_provider;
 mod config;
 mod durable;
 #[cfg(test)]
@@ -7,6 +9,7 @@ mod git;
 mod review;
 mod review_artifacts;
 mod review_checkpoint;
+mod review_dispatch;
 mod review_inputs;
 mod session_artifacts;
 mod telemetry;

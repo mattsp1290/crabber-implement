@@ -1,11 +1,6 @@
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
-use std::{
-    fs,
-    num::{NonZeroU32, NonZeroUsize},
-    path::PathBuf,
-    time::Duration,
-};
+use std::{fs, num::NonZeroUsize, path::PathBuf, time::Duration};
 
 use crate::git;
 
@@ -35,13 +30,18 @@ pub struct Cli {
     /// Base branch. Defaults to .ralph main_branch or main.
     #[arg(long)]
     pub base: Option<String>,
-    #[arg(long, env = "CRABBER_IMPLEMENT_MODEL", default_value = "glm-5.2")]
+    #[arg(long, env = "CRABBER_IMPLEMENT_MODEL", default_value = MODEL)]
     pub model: String,
-    /// OpenAI-compatible API root, without /chat/completions.
+    #[arg(long, default_value = "medium")]
+    pub reasoning_effort: crabber::ReasoningEffort,
+    /// Native Codex login file, read only by the host.
+    #[arg(long)]
+    pub codex_auth_file: Option<PathBuf>,
+    /// Codex Responses API root, without /responses.
     #[arg(
         long,
-        env = "CRABBER_IMPLEMENT_BASE_URL",
-        default_value = "https://opencode.ai/zen/go/v1"
+        env = "CRABBER_IMPLEMENT_CODEX_BASE_URL",
+        default_value = "https://chatgpt.com/backend-api/codex"
     )]
     pub base_url: String,
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=100))]
@@ -49,34 +49,17 @@ pub struct Cli {
     /// Maximum model turns per agent session.
     #[arg(long, env = "CRABBER_IMPLEMENT_MAX_TURNS", default_value = "256")]
     pub max_turns: NonZeroUsize,
-    /// Maximum wall time per agent session.
-    #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..))]
+    /// Maximum wall time per agent session, up to the inline delegation limit of one hour.
+    #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub session_timeout: u64,
-    /// Initial maximum output tokens per model response.
-    #[arg(long, default_value = "16384")]
-    pub max_output_tokens: NonZeroU32,
-    /// Maximum output tokens requested during truncation recovery.
-    #[arg(long, default_value = "65536")]
-    pub max_recovery_output_tokens: NonZeroU32,
 }
 
-#[derive(Clone, Copy)]
-pub struct OutputBudget {
-    pub initial: NonZeroU32,
-    pub ceiling: NonZeroU32,
-}
-
-impl OutputBudget {
-    fn new(initial: NonZeroU32, ceiling: NonZeroU32) -> Result<Self> {
-        ensure!(
-            initial <= ceiling,
-            "--max-recovery-output-tokens must be at least --max-output-tokens"
-        );
-        Ok(Self { initial, ceiling })
-    }
-}
+pub const MODEL: &str = "gpt-5.6-terra";
+pub const PROVIDER_PROFILE: &str = "codex_cli";
 
 pub struct RunConfig {
+    pub codex_auth_file: PathBuf,
+    pub reasoning_effort: crabber::ReasoningEffort,
     pub repo: PathBuf,
     pub plan: PlanBundle,
     pub review_skill: String,
@@ -86,7 +69,6 @@ pub struct RunConfig {
     pub max_reviews: u32,
     pub max_turns: NonZeroUsize,
     pub session_timeout: Duration,
-    pub output_budget: OutputBudget,
     pub artifacts: PathBuf,
     pub run_id: String,
     pub _repo_lock: fs::File,
@@ -176,8 +158,6 @@ impl PlanBundle {
 
 impl RunConfig {
     pub fn load(cli: Cli) -> Result<Self> {
-        let output_budget =
-            OutputBudget::new(cli.max_output_tokens, cli.max_recovery_output_tokens)?;
         let plan = PlanBundle::load(&cli.plan)?;
         let home = std::env::var_os("HOME").context("HOME is not set")?;
         let skills = cli
@@ -220,6 +200,10 @@ impl RunConfig {
             .context("another crabber-implement process owns this repository")?;
         git::require_clean(&repo)?;
         ensure!(!cli.model.trim().is_empty(), "model cannot be empty");
+        let codex_auth_file = cli
+            .codex_auth_file
+            .map(Ok)
+            .unwrap_or_else(crate::codex_auth::default_path)?;
         let run_id = cli
             .resume_review
             .unwrap_or_else(uuid::Uuid::new_v4)
@@ -267,11 +251,12 @@ impl RunConfig {
             review_skill,
             base,
             model: cli.model,
+            reasoning_effort: cli.reasoning_effort,
+            codex_auth_file,
             base_url: cli.base_url,
             max_reviews: cli.max_reviews,
             max_turns: cli.max_turns,
             session_timeout: Duration::from_secs(cli.session_timeout),
-            output_budget,
             artifacts,
             run_id,
             _repo_lock: repo_lock,
@@ -287,7 +272,7 @@ impl RunConfig {
                 .join("crabber-implement")
                 .join(source_id.to_string());
             let source = crate::review_checkpoint::RefreshSource::load(&config, &source_root)?;
-            require_credentials()?;
+            require_credentials(&config)?;
             config.refresh_source = Some(source);
         } else if let Some(state) = &config.resume {
             config.recovery_origin =
@@ -308,10 +293,10 @@ impl RunConfig {
                 "implementation anchor is not an ancestor of reviewed HEAD"
             );
             if state.needs_credentials(&config.artifacts)? {
-                require_credentials()?;
+                require_credentials(&config)?;
             }
         } else {
-            require_credentials()?;
+            require_credentials(&config)?;
             crate::durable::directory(&config.artifacts)?;
             crate::durable::bytes(
                 &config.artifacts.join("plan.md"),
@@ -333,37 +318,23 @@ impl RunConfig {
     }
 }
 
-pub(crate) fn require_credentials() -> Result<()> {
-    ensure!(
-        std::env::var("OPENCODE_GO_API_KEY").is_ok_and(|key| !key.is_empty()),
-        "export OPENCODE_GO_API_KEY before running"
-    );
-    Ok(())
+pub(crate) fn require_credentials(config: &RunConfig) -> Result<()> {
+    crate::codex_auth::validate(&config.codex_auth_file)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn output_budget_defaults_and_overrides_are_validated() {
-        let defaults = Cli::try_parse_from(["cli", "plan.md"]).unwrap();
-        assert_eq!(defaults.max_output_tokens.get(), 16384);
-        assert_eq!(defaults.max_recovery_output_tokens.get(), 65536);
-        let custom = Cli::try_parse_from([
-            "cli",
-            "plan.md",
-            "--max-output-tokens",
-            "20000",
-            "--max-recovery-output-tokens",
-            "50000",
-        ])
-        .unwrap();
-        let budget =
-            OutputBudget::new(custom.max_output_tokens, custom.max_recovery_output_tokens).unwrap();
-        assert_eq!(budget.initial.get(), 20000);
-        assert_eq!(budget.ceiling.get(), 50000);
+    fn codex_defaults_and_delegation_timeout_are_explicit() {
+        let cli = Cli::try_parse_from(["cli", "plan.md"]).unwrap();
+        assert_eq!(cli.model, "gpt-5.6-terra");
+        assert_eq!(cli.reasoning_effort, crabber::ReasoningEffort::Medium);
+        assert_eq!(cli.base_url, "https://chatgpt.com/backend-api/codex");
+        assert!(Cli::try_parse_from(["cli", "plan.md", "--session-timeout", "3601"]).is_err());
         assert!(
-            OutputBudget::new(custom.max_recovery_output_tokens, custom.max_output_tokens).is_err()
+            Cli::try_parse_from(["cli", "plan.md", "--max-recovery-output-tokens", "65536"])
+                .is_err()
         );
     }
 
