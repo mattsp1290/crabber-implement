@@ -354,7 +354,7 @@ fn formal_checkpoint_reachability() {
     let (_tmp, config) = checkpoint::tests::fixture();
     let inputs = checkpoint::ReviewInputs::current(&config, ["a".into(), "b".into()]).unwrap();
     assert!(checkpoint::identity_matches(&inputs, &inputs));
-    for changed in 0..18 {
+    for changed in 0..19 {
         let mut other = inputs.clone();
         match changed {
             0 => other.head.push('x'),
@@ -369,8 +369,8 @@ fn formal_checkpoint_reachability() {
             9 => other.skill.push('x'),
             10 => other.endpoint.push('x'),
             11 => other.turns += 1,
-            12 => other.output += 1,
-            13 => other.recovery += 1,
+            12 => other.provider_profile.push_str("-changed"),
+            13 => other.reasoning_effort.push_str("-changed"),
             14 => other.executable.push('x'),
             15 => other.prompts[1].push('x'),
             16 => {
@@ -379,7 +379,8 @@ fn formal_checkpoint_reachability() {
                     policy: 1,
                 })
             }
-            _ => other.origin = Some("0".repeat(64)),
+            17 => other.origin = Some("0".repeat(64)),
+            _ => other.protocol.push_str("-changed"),
         }
         assert!(
             !checkpoint::identity_matches(&inputs, &other),
@@ -578,4 +579,59 @@ fn formal_refresh_old_reports_are_evidence_only() {
     for (path, bytes) in reports {
         assert_eq!(fs::read(path).unwrap(), bytes);
     }
+}
+
+#[test]
+fn formal_delegation_reservations() {
+    use crate::review_dispatch::Reservations;
+    let mut cases = 0;
+    for missing in [[false, false], [false, true], [true, false], [true, true]] {
+        for background in [false, true] {
+            for profile in ["correctness", "maintainability", "unknown"] {
+                for task in [
+                    "correctness-attempt",
+                    "maintainability-attempt",
+                    "unreserved",
+                ] {
+                    let names = std::array::from_fn(|role| {
+                        missing[role].then(|| format!("{}-attempt", checkpoint::ROLES[role].0))
+                    });
+                    let mut reservations = Reservations::new(names);
+                    let expected = checkpoint::ROLES
+                        .iter()
+                        .position(|role| role.0 == profile)
+                        .filter(|role| {
+                            !background
+                                && missing[*role]
+                                && task == format!("{}-attempt", checkpoint::ROLES[*role].0)
+                        });
+                    assert_eq!(
+                        reservations.claim(profile, task, background),
+                        expected,
+                        "delegation escaped immutable role reservation"
+                    );
+                    if expected.is_some() {
+                        assert!(
+                            reservations.claim(profile, task, background).is_none(),
+                            "delegation dispatched the same role twice"
+                        );
+                    }
+                    for (role, missing) in missing.iter().enumerate() {
+                        let result = reservations.claim(
+                            checkpoint::ROLES[role].0,
+                            &format!("{}-attempt", checkpoint::ROLES[role].0),
+                            false,
+                        );
+                        assert_eq!(
+                            result,
+                            (*missing && expected != Some(role)).then_some(role),
+                            "delegation consumed an independent role"
+                        );
+                    }
+                    cases += 1;
+                }
+            }
+        }
+    }
+    println!("crabber-delegation-checker-v1 cases={cases} safety=PASS termination=PASS");
 }

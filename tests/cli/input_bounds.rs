@@ -5,7 +5,7 @@ fn rejects_before_mutation(repo: &Path, fixture: &Fixture, plan: &Path, needle: 
     let branch = git(repo, &["branch", "--show-current"]);
     for mode in [None, Some("--resume-review"), Some("--refresh-review")] {
         let mut command = recovery_command(repo, fixture, plan);
-        command.env_remove("OPENCODE_GO_API_KEY");
+        remove_auth(&mut command);
         if let Some(mode) = mode {
             command.args([mode, "11111111-1111-4111-8111-111111111111"]);
         }
@@ -14,7 +14,7 @@ fn rejects_before_mutation(repo: &Path, fixture: &Fixture, plan: &Path, needle: 
         let error = String::from_utf8_lossy(&output.stderr).to_lowercase();
         assert!(error.contains(needle), "{mode:?}: {error}");
         assert!(
-            !error.contains("export opencode"),
+            !error.contains("codex login"),
             "credentials checked before input: {error}"
         );
         assert_eq!(git(repo, &["rev-parse", "HEAD"]), head);

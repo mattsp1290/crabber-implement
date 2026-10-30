@@ -209,6 +209,7 @@ async function readRun(root, id, full, now) {
         reviewRound: session?.review_round ?? null,
         reviewRole: session?.review_role ?? null,
         reviewAttempt: session?.review_attempt ?? null,
+        parentDelegation: session?.parent_delegation ?? null,
         reused: !!activeRecovery && activeNames.some((n,i) => n === name && activeRecovery.reused[i]),
         maxTurns: session?.max_turns ?? null,
         text: text ?? { content: "", truncated: false },

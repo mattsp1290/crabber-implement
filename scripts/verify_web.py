@@ -24,6 +24,11 @@ browser_image = 'mcr.microsoft.com/playwright:v1.64.1-noble'
 
 def run(command, **kwargs):
     subprocess.run(command, cwd=ROOT, check=True, **kwargs)
+    if command[:2] == ['docker', 'stop']:
+        wait_until(lambda: subprocess.run(
+            ['docker', 'inspect', command[2]], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL).returncode != 0,
+            'stopped monitor container removal', timeout=30)
 
 
 def port():

@@ -14,7 +14,7 @@ cargo build --locked
 ./target/debug/crabber-implement --help
 ```
 
-The executable prints `Usage: crabber-implement [OPTIONS] <PLAN>`. Help lists `--max-output-tokens` with default 16384 and `--max-recovery-output-tokens` with default 65536. Verify cap-dependent escalation and bounded exhaustion through `features/completion.md`. Each invocation exits when its workflow finishes. The React monitor is a separate process. It requires Git and ripgrep 14 or later. The live provider requires `OPENCODE_GO_API_KEY` in the environment. The CLI does not source `~/.profile`.
+The executable prints `Usage: crabber-implement [OPTIONS] <PLAN>`. Help lists model `gpt-5.6-terra`, reasoning effort `medium`, `--codex-auth-file`, and a session timeout bounded at 3600 seconds. Each invocation exits when its workflow finishes. The React monitor is separate. Git and ripgrep 14 or later are required. Live requests use the existing Codex ChatGPT subscription through native `auth.json`; no API key or OpenCode provider is supported.
 
 ## Doctor
 
@@ -23,11 +23,7 @@ The executable prints `Usage: crabber-implement [OPTIONS] <PLAN>`. Help lists `-
 rg --version
 ```
 
-Expect `crabber-implement 0.1.0` and ripgrep 14 or later. Before a live journey, confirm the key exists without printing it.
-
-```sh
-python3 -c 'import os; assert os.environ.get("OPENCODE_GO_API_KEY"), "Export OPENCODE_GO_API_KEY"'
-```
+Expect `crabber-implement 0.1.0` and ripgrep 14 or later. Before an authorized live journey, sign in through `codex login` and confirm its login file exists without printing its contents. An expired access token requires refreshing the login through Codex. The host only reads access-token/account/expiry metadata and never writes or clears the file.
 
 ## Drive
 
@@ -38,17 +34,17 @@ mkdir -p .audit/verification
 cargo test --locked --test cli -- --nocapture > .audit/verification/cli.txt 2>&1
 ```
 
-For the real provider, export the key in your own shell and run the live helper. Never print or commit its value.
+For an authorized real-provider check, use the existing Codex login and run the live helper. Never print or copy token values.
 
 ```sh
 python3 scripts/verify_live.py --evidence .audit/live
 ```
 
-This helper creates a disposable Git repository and a plan. It runs the actual executable with GLM-5.2, then independently runs the requested Python program and compares its output. It copies workflow and review artifacts before deleting its scratch repository. A failed assertion means the journey failed. Read the captured stderr and result rather than assuming a model summary proves success.
+This helper creates a disposable Git repository and a plan. It runs the actual executable with `gpt-5.6-terra` with medium reasoning, then independently runs the requested Python program and compares its output. It copies workflow and review artifacts before deleting its scratch repository. A failed assertion means the journey failed. Read the captured stderr and result rather than assuming a model summary proves success.
 
 For a turn-limit regression, run the focused [model turn budget journey](features/turn-budget.md). It exercises more than 64 model requests through the actual executable and verifies explicit-budget failure. It uses no live provider credential.
 
-For premature completion or retry changes, run the [model completion journey](features/completion.md). It checks bounded continuations, shared budgets, rejected truncated tools, preserved post-compaction prompts, and final-answer isolation from failed attempts.
+For premature completion or retry changes, run the [model completion journey](features/completion.md). It checks bounded empty-completion continuations, shared budgets, preserved post-compaction prompts, and final-answer isolation from failed attempts.
 
 For the React monitor, run the [Docker and Playwright journey](features/monitor.md). It launches the production monitor in Docker, drives real artifact updates through a browser, and observes the actual CLI before and after a paused model response. No provider credential is needed.
 
@@ -75,3 +71,5 @@ Datadog APM traces default to the loopback agent receiver. Follow `features/tele
 For checkpoint, resume, reviewer identity or rendering changes, run [review recovery](features/review-recovery.md). Preserve the same binary throughout each two-process journey; do not run source mutation checks concurrently with browser or CLI recovery tests.
 
 For final reviewer prompts, snapshots, artifact tools, or input caps, run [bounded review inputs](features/bounded-review-inputs.md). For an upgraded executable, use the explicit refresh journey in [review recovery](features/review-recovery.md). Normal invocation, strict resume, and refresh have separate acceptance checks. Never run source mutations while a browser or strict-resume journey depends on an unchanged executable.
+
+For the Codex route and native review ownership, run [Codex subagents](features/codex-subagents.md). The local coordinator calls the native extension through a real parent Agent; each child records its parent session/run/call IDs. Strict resume and refresh accept only checkpoint version 3. All older provider records are rejected before model calls.

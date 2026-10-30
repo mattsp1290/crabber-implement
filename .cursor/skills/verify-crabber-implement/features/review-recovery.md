@@ -28,7 +28,7 @@ Do not rebuild or mutate sources while a recovery journey runs: input identity i
 
 ## Refresh after an executable change
 
-Strict resume keeps the saved executable, prompt, snapshot, and recovery-origin identities. `--refresh-review` imports an eligible version 1 or version 2 source into a fresh child. Both roles start at attempt 1, with no reused approval. The child retains the original implementation anchor and global review budget.
+Strict resume keeps the saved executable, prompt, snapshot, and recovery-origin identities. `--refresh-review` imports an eligible version 3 Codex native-subagent source into a fresh child. Both roles start at attempt 1, with no reused approval. The child retains the original implementation anchor and global review budget.
 
 ```sh
 cargo test --locked --test cli refresh_ -- --test-threads=2
@@ -37,6 +37,6 @@ python3 scripts/verify_web.py --evidence .audit/bounded-review-inputs/web
 
 Require a final-round source to start both fresh reviewers without implementation or fix calls. A change request at the maximum round must fail without fixing. An earlier-round child can fix, review again, and resume under its own identity. A refresh of that child must retain deduplicated inherited evidence and the same original implementation anchor, even after both parent artifact directories are unavailable.
 
-For the exact legacy failure journey, retain a compatible old executable before rebuilding and pass its path through `CRABBER_VERIFY_LEGACY_BINARY`. The fixture first uses that executable to create a version 1 round-4 admission failure after three fixes, then refreshes with the current binary. It never edits the original incident repository.
+Version 1 and version 2 provider records are rejected before any model call. There is no legacy executable import or OpenCode recovery path.
 
 The Docker refresh journey observes the failed parent, both child reviewers running at global round 4 and attempt 1, then child completion. Inspect the refresh screenshots, browser result, and copied source and child artifact directories. The parent failure and all source bytes remain unchanged. Child `recovery-origin.json`, `implementation.json`, and `inherited-evidence/` survive cleanup. Publication fault tests and process-kill tests must never treat an incomplete snapshot as a ready checkpoint. Run formal source mutations only after every recovery process has exited.
