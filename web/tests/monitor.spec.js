@@ -372,3 +372,18 @@ test("a refreshed round-four run links to its failed parent and starts two fresh
     await rm(parentDir, { recursive: true, force: true });
   }
 });
+
+test("native Codex review shows the delegated child under version three metadata", async ({ page }, testInfo) => {
+  clearInterval(heartbeat);
+  await put("run.json", { ...metadata(), version: 3, execution_generation: 1, model: "gpt-5.6-terra" });
+  await put("review-state.json", { version: 3, workflow_id: id, generation: 1, round: 1, phase: "review_pending", attempts: [1, 0], reused: [false, false] });
+  await stage("review", 1, "started");
+  const name = "review-1-correctness-attempt-1";
+  await put(`${name}.session.json`, { name, status: "running", execution_generation: 1, review_round: 1, review_role: "correctness", review_attempt: 1, parent_delegation: { session_id: "native-parent-session", run_id: "native-parent-run", call_id: "native-parent-call" } });
+  await put(`${name}.txt`, "Inspecting the immutable review snapshot.");
+  await page.goto(`/?run=${id}`);
+  await expect(page.getByTestId("run-status")).toHaveAttribute("data-status", "running");
+  await expect(page.getByText("Crabber subagent", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("session-output")).toContainText("Inspecting the immutable review snapshot.");
+  await page.screenshot({ path: testInfo.outputPath("native-subagent-review.png"), fullPage: true });
+});

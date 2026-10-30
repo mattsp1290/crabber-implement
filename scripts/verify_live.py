@@ -11,12 +11,14 @@ import time
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--binary', default='target/debug/crabber-implement')
 parser.add_argument('--evidence', default='.audit/live')
+parser.add_argument('--codex-auth-file', type=Path, default=Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex') / 'auth.json')
 args = parser.parse_args()
 binary = Path(args.binary).resolve()
 evidence = Path(args.evidence).resolve()
 evidence.mkdir(parents=True, exist_ok=True)
-if not os.environ.get('OPENCODE_GO_API_KEY'):
-    raise SystemExit('Export OPENCODE_GO_API_KEY before running live verification.')
+auth_file = args.codex_auth_file.expanduser().resolve()
+if not auth_file.is_file():
+    raise SystemExit('Run codex login before live verification, or pass --codex-auth-file.')
 
 
 def run(argv, cwd, **kwargs):
@@ -50,7 +52,7 @@ product behavior is required.
         result = run(argv, repo)
         result.check_returncode()
     started = time.time()
-    result = run([str(binary), str(plan), '--repo', str(repo), '--max-reviews', '3', '--max-turns', '256', '--session-timeout', '240'], repo, timeout=1600)
+    result = run([str(binary), str(plan), '--codex-auth-file', str(auth_file), '--repo', str(repo), '--max-reviews', '3', '--max-turns', '256', '--session-timeout', '240'], repo, timeout=1600)
     (evidence / 'stdout.txt').write_text(result.stdout)
     (evidence / 'stderr.txt').write_text(result.stderr)
     actual = run(['python3', 'hello.py'], repo)
@@ -74,10 +76,23 @@ product behavior is required.
     workflow_results = list((repo / '.git' / 'crabber-implement').glob('*/result.json'))
     workflow_completed = bool(workflow_results) and json.loads(workflow_results[-1].read_text()).get('status') == 'completed'
     sessions = [json.loads(path.read_text()) for path in (repo / '.git' / 'crabber-implement').glob('*/*.session.json')]
-    session_evidence_present = len(sessions) >= 3 and all(
+    children = [session for session in sessions if session.get('parent_delegation')]
+    model_sessions = [session for session in sessions if session.get('provider') != 'local-review-dispatch']
+    parents = {session['session_id']: session for session in sessions
+               if session.get('provider') == 'local-review-dispatch'}
+    delegation_evidence_present = bool(children) and all(
+        (parent := parents.get(child['parent_delegation'].get('session_id'))) is not None
+        and parent.get('status') == 'completed'
+        and parent.get('run_id') == child['parent_delegation'].get('run_id')
+        and child['parent_delegation'].get('call_id')
+        and any(child['parent_delegation']['call_id'] in path.read_text()
+                for path in (repo / '.git' / 'crabber-implement').glob(f"*/{parent['name']}.tools.txt"))
+        for child in children
+    )
+    session_evidence_present = len(children) >= 2 and all(
         session.get('session_id') and session.get('run_id') and session.get('max_turns') == 256
         and session.get('observed_turns', 0) > 0 and session.get('status') == 'completed'
-        for session in sessions
+        for session in model_sessions
     )
     summary = {
         'exit_code': result.returncode,
@@ -88,6 +103,7 @@ product behavior is required.
         'review_files_present': review_files_present,
         'workflow_completed': workflow_completed,
         'session_evidence_present': session_evidence_present,
+        'native_delegation_evidence_present': delegation_evidence_present,
         'elapsed_seconds': round(time.time() - started, 1),
         'scratch_repository_removed_on_exit': True,
     }
@@ -95,5 +111,5 @@ product behavior is required.
     print(json.dumps(summary))
     assert result.returncode == 0, 'CLI failed. Read evidence stdout.txt and stderr.txt.'
     assert actual.returncode == 0 and summary['program_output_matches'], 'Plan acceptance criterion failed.'
-    assert all(summary[key] for key in ['clean_repository', 'review_matches_head', 'review_files_present', 'workflow_completed', 'session_evidence_present']), 'Review or repository evidence failed.'
+    assert all(summary[key] for key in ['clean_repository', 'review_matches_head', 'review_files_present', 'workflow_completed', 'session_evidence_present', 'native_delegation_evidence_present']), 'Review or repository evidence failed.'
 assert (evidence / 'result.json').is_file(), 'Evidence did not survive cleanup.'

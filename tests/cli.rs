@@ -1,3 +1,7 @@
+#[path = "cli/responses.rs"]
+mod responses;
+use responses::{fixture_command, remove_auth, responses_sse};
+
 #[path = "cli/bounded.rs"]
 mod bounded;
 
@@ -114,32 +118,13 @@ impl Fixture {
                             .unwrap()
                             .iter()
                             .any(|message| message["role"] == "tool");
-                        if serialized.contains("TRANSPORT_OUTAGE") || (serialized.contains("TRANSPORT_RECOVER") && has_result
-                            && !serialized.contains("Perform your assigned independent review")
-                            && !serialized.contains("Execute the following fix-review skill")) {
-                            let attempt = requests.fetch_add(1, Ordering::Relaxed);
-                            if serialized.contains("TRANSPORT_OUTAGE") || attempt < 4 {
-                                if serialized.contains("TRANSPORT_RECOVER") {
-                                    assert_eq!(std::fs::read_to_string(repo.join("hello.txt")).unwrap(), "initial\n");
-                                }
-                                return;
-                            }
-                        }
-                        if serialized.contains("COMPLETION_BUDGET_REJECT") && body["max_tokens"].as_u64().unwrap() > 16384 {
-                            let payload = r#"{"error":{"message":"fixture rejects requested output cap","type":"invalid_request_error"}}"#;
-                            write!(stream, "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload).unwrap();
-                            return;
-                        }
                         let response = if serialized.contains("Summarize this context for continuation") {
-                            if serialized.contains("COMPLETION_SUMMARY_LENGTH") {
-                                output_length()
-                            } else if serialized.contains("COMPLETION_STREAM_VISIBLE") {
+                            if serialized.contains("COMPLETION_STREAM_VISIBLE") {
                                 text("COMPLETION_STREAM_VISIBLE The assigned task wrote hello.txt with initial greeting. Complete verification and report the result.")
                             } else {
                                 text("COMPLETION_STREAM_HIDDEN Complete the assigned task by writing hello.txt with initial greeting, then report the result.")
                             }
-                        } else if serialized.contains("COMPLETION_BUDGET_STAGES") && body["max_tokens"].as_u64().unwrap() < 32768 {
-                            output_length()
+
                         } else if serialized
                             .contains("Perform your assigned independent review")
                         {
@@ -187,28 +172,11 @@ impl Fixture {
                             }
                         } else if serialized.contains("COMPLETION_") {
                             let attempt = requests.fetch_add(1, Ordering::Relaxed);
-                            let continued = body["messages"].as_array().unwrap().iter().any(|message| message["role"] == "user" && !message["content"].to_string().contains("COMPLETION_"));
                             if serialized.contains("COMPLETION_DUPLICATE_START") {
                                 json!({"choices":[{"index":0,"delta":{"tool_calls":[
                                     {"index":0,"id":"duplicate-call","function":{"name":"file_read","arguments":"{}"}},
                                     {"index":1,"id":"duplicate-call","function":{"name":"file_read","arguments":"{}"}}
                                 ]},"finish_reason":"tool_calls"}]})
-                            } else if serialized.contains("COMPLETION_BUDGET_PRESERVE") && !has_result {
-                                tool("file_write", json!({"path":"hello.txt","content":"partial work\n"}))
-                            } else if (serialized.contains("COMPLETION_BUDGET_MIXED") && !serialized.contains("COMPLETION_BUDGET_MIXED_EXHAUST") && attempt == 0)
-                                || (serialized.contains("COMPLETION_BUDGET_MIXED_EXHAUST") && attempt == 1) {
-                                json!({"choices":[{"index":0,"delta":{"reasoning_content":"Private empty budget sentinel"},"finish_reason":"stop"}]})
-                            } else if serialized.contains("COMPLETION_BUDGET_ALWAYS")
-                                || serialized.contains("COMPLETION_BUDGET_PRESERVE")
-                                || serialized.contains("COMPLETION_BUDGET_MIXED_EXHAUST")
-                                || serialized.contains("COMPLETION_BUDGET_REJECT")
-                                || serialized.contains("COMPLETION_BUDGET_DELAY")
-                                || serialized.contains("COMPLETION_BUDGET_CANCEL")
-                                || (serialized.contains("COMPLETION_BUDGET_MIXED") && body["max_tokens"].as_u64().unwrap() < 32768)
-                                || (serialized.contains("COMPLETION_BUDGET_THIRD") && body["max_tokens"].as_u64().unwrap() < 65536) {
-                                output_length()
-                            } else if serialized.contains("COMPLETION_CAP_RECOVER") && body["max_tokens"].as_u64().unwrap() < 32768 {
-                                json!({"choices":[{"index":0,"delta":{"reasoning_content":"Private output budget sentinel"},"finish_reason":"length"}]})
                             } else if serialized.contains("COMPLETION_STREAM_VISIBLE") && attempt == 0 {
                                 tool("file_write", json!({"path":"hello.txt","content":"initial\n"}))
                             } else if serialized.contains("COMPLETION_STREAM_HIDDEN") && attempt == 1 {
@@ -225,8 +193,7 @@ impl Fixture {
                                 json!({"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]})
                             } else if serialized.contains("COMPLETION_EMPTY") || serialized.contains("COMPLETION_DELAY") || serialized.contains("COMPLETION_CANCEL") || (serialized.contains("COMPLETION_RECOVER") && attempt == 1) {
                                 json!({"choices":[{"index":0,"delta":{"reasoning_content":"Private fixture reasoning."},"finish_reason":"stop"}]})
-                            } else if serialized.contains("COMPLETION_LENGTH") && !continued {
-                                json!({"choices":[{"index":0,"delta":{"content":"Partial narration"},"finish_reason":"length"}]})
+
                             } else if serialized.contains("COMPLETION_RECOVER") && attempt == 0 {
                                 {
                                     let mut response = tool("file_read", json!({"path":"README.md"}));
@@ -262,18 +229,18 @@ impl Fixture {
                             )
                         };
                         if (serialized.contains("COMPLETION_STREAM_HIDDEN") && requests.load(Ordering::Relaxed) == 1 && !serialized.contains("Summarize this context for continuation"))
-                            || ((serialized.contains("COMPLETION_STREAM_VISIBLE") || serialized.contains("COMPLETION_SUMMARY_LENGTH")) && requests.load(Ordering::Relaxed) == 2 && !serialized.contains("Summarize this context for continuation")) {
+                            || (serialized.contains("COMPLETION_STREAM_VISIBLE") && requests.load(Ordering::Relaxed) == 2 && !serialized.contains("Summarize this context for continuation")) {
                             let partial = json!({"choices":[{"index":0,"delta":{"content":"BLOCKED: stale failed response. "},"finish_reason":null}]});
-                            let error = json!({"error":{"code":400,"message":"fixture overflow","metadata":{"error_type":"context_length_exceeded"}}});
-                            let payload = format!("data: {partial}\n\ndata: {error}\n\n");
+                            let error = json!({"type":"response.failed","response":{"error":{"code":"context_length_exceeded","message":"fixture overflow"}}});
+                            let payload = format!("{}event: response.failed\ndata: {error}\n\n", responses_sse(&partial));
                             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload).unwrap();
                             return;
                         }
                         if has_result && serialized.contains("LIVE_ARTIFACTS")
                             && !serialized.contains("Perform your assigned independent review")
                             && !serialized.contains("Execute the following fix-review skill") {
-                            let first = format!("data: {}\n\n", json!({"choices":[{"index":0,"delta":{"content":"Implemented live "},"finish_reason":null}]}));
-                            let last = format!("data: {}\n\ndata: [DONE]\n\n", text("artifacts and verified hello.txt."));
+                            let first = responses_sse(&json!({"choices":[{"index":0,"delta":{"content":"Implemented live "},"finish_reason":null}]}));
+                            let last = responses_sse(&text("artifacts and verified hello.txt."));
                             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", first.len() + last.len(), first).unwrap();
                             stream.flush().unwrap();
                             while !release.load(Ordering::Relaxed) && !stopped.load(Ordering::Relaxed) {
@@ -284,18 +251,18 @@ impl Fixture {
                             }
                             return;
                         }
-                        if serialized.contains("COMPLETION_DELAY") || serialized.contains("COMPLETION_BUDGET_DELAY") {
+                        if serialized.contains("COMPLETION_DELAY") {
                             thread::sleep(Duration::from_millis(if requests.load(Ordering::Relaxed) == 1 { 900 } else { 2500 }));
                         }
-                        if (serialized.contains("COMPLETION_CANCEL") || serialized.contains("COMPLETION_BUDGET_CANCEL")) && requests.load(Ordering::Relaxed) > 1 {
+                        if (serialized.contains("COMPLETION_CANCEL")) && requests.load(Ordering::Relaxed) > 1 {
                             while !stopped.load(Ordering::Relaxed) {
                                 thread::sleep(Duration::from_millis(10));
                             }
                             return;
                         }
-                        let payload = format!("data: {}\n\ndata: [DONE]\n\n", response);
+                        let payload = responses_sse(&response);
                         if let Err(error) = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload) {
-                            assert!((serialized.contains("COMPLETION_DELAY") || serialized.contains("COMPLETION_BUDGET_DELAY") || serialized.contains("REVIEW_BROWSER"))
+                            assert!((serialized.contains("COMPLETION_DELAY") || serialized.contains("REVIEW_BROWSER"))
                                 && matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset), "fixture response: {error}");
                         }
                         }));
@@ -342,7 +309,7 @@ fn request(stream: &mut TcpStream) -> Value {
         bytes.extend_from_slice(&buffer[..count]);
         if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
             let headers = String::from_utf8_lossy(&bytes[..end]);
-            assert!(headers.starts_with("POST /chat/completions "));
+            responses::assert_headers(&headers);
             let length: usize = headers
                 .lines()
                 .find_map(|line| {
@@ -360,7 +327,7 @@ fn request(stream: &mut TcpStream) -> Value {
         assert!(count > 0);
         bytes.extend_from_slice(&buffer[..count]);
     }
-    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap()
+    responses::normalize(serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap())
 }
 
 fn text(content: &str) -> Value {
@@ -384,7 +351,7 @@ fn cli_implements_fixes_and_requires_fresh_review() {
     let plan_dir = tempfile::tempdir().unwrap();
     let plan = plan_dir.path().join("plan.md");
     std::fs::write(&plan, "Create hello.txt with the requested greeting.\n").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+    let output = fixture_command(env!("CARGO_BIN_EXE_crabber-implement"))
         .arg(&plan)
         .arg("--repo")
         .arg(repo.path())
@@ -395,7 +362,6 @@ fn cli_implements_fixes_and_requires_fresh_review() {
         .arg("--session-timeout")
         .arg("20")
         .env("HOME", repo.path())
-        .env("OPENCODE_GO_API_KEY", "fixture-key")
         .env("CRABBER_IMPLEMENT_NO_TELEMETRY", "true")
         .output()
         .unwrap();
@@ -422,6 +388,7 @@ fn cli_implements_fixes_and_requires_fresh_review() {
     assert!(stdout.contains("fix-review 1"));
     assert!(stdout.contains("review 2"));
     assert!(stdout.contains("done "));
+    responses::assert_native_delegations(&run_artifacts(repo.path()), 4);
     assert_eq!(
         std::fs::read_dir(repo.path().join("reviews"))
             .unwrap()
@@ -437,7 +404,7 @@ fn malformed_review_cannot_complete_workflow() {
     let plan_dir = tempfile::tempdir().unwrap();
     let plan = plan_dir.path().join("plan.md");
     std::fs::write(&plan, "Create hello.txt.\n").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+    let output = fixture_command(env!("CARGO_BIN_EXE_crabber-implement"))
         .arg(&plan)
         .arg("--repo")
         .arg(repo.path())
@@ -448,7 +415,6 @@ fn malformed_review_cannot_complete_workflow() {
         .arg("--session-timeout")
         .arg("20")
         .env("HOME", repo.path())
-        .env("OPENCODE_GO_API_KEY", "fixture-key")
         .env("CRABBER_IMPLEMENT_NO_TELEMETRY", "true")
         .output()
         .unwrap();
@@ -459,7 +425,7 @@ fn malformed_review_cannot_complete_workflow() {
 
 #[test]
 fn missing_plan_and_dirty_repository_fail_before_network() {
-    let output = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+    let output = fixture_command(env!("CARGO_BIN_EXE_crabber-implement"))
         .arg("/does/not/exist.md")
         .output()
         .unwrap();
@@ -469,7 +435,7 @@ fn missing_plan_and_dirty_repository_fail_before_network() {
     let plan = tempfile::NamedTempFile::with_suffix(".md").unwrap();
     std::fs::write(plan.path(), "Implement the task.").unwrap();
     std::fs::write(repo.path().join("uncommitted.txt"), "keep me").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+    let output = fixture_command(env!("CARGO_BIN_EXE_crabber-implement"))
         .arg(plan.path())
         .arg("--repo")
         .arg(repo.path())
@@ -491,7 +457,7 @@ fn exhausted_review_budget_never_runs_fixes_or_claims_done() {
     let fixture = Fixture::start(repo.path(), false);
     let plan = tempfile::NamedTempFile::with_suffix(".md").unwrap();
     std::fs::write(plan.path(), "Create hello.txt.").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+    let output = fixture_command(env!("CARGO_BIN_EXE_crabber-implement"))
         .arg(plan.path())
         .arg("--repo")
         .arg(repo.path())
@@ -504,7 +470,6 @@ fn exhausted_review_budget_never_runs_fixes_or_claims_done() {
         .arg("--session-timeout")
         .arg("20")
         .env("HOME", repo.path())
-        .env("OPENCODE_GO_API_KEY", "fixture-key")
         .env("CRABBER_IMPLEMENT_NO_TELEMETRY", "true")
         .output()
         .unwrap();
@@ -524,7 +489,7 @@ fn agent_branch_drift_stops_before_host_commit() {
     let fixture = Fixture::start(repo.path(), false);
     let plan = tempfile::NamedTempFile::with_suffix(".md").unwrap();
     std::fs::write(plan.path(), "DRIFT_BRANCH").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+    let output = fixture_command(env!("CARGO_BIN_EXE_crabber-implement"))
         .arg(plan.path())
         .arg("--repo")
         .arg(repo.path())
@@ -535,7 +500,6 @@ fn agent_branch_drift_stops_before_host_commit() {
         .arg("--session-timeout")
         .arg("20")
         .env("HOME", repo.path())
-        .env("OPENCODE_GO_API_KEY", "fixture-key")
         .env("CRABBER_IMPLEMENT_NO_TELEMETRY", "true")
         .output()
         .unwrap();
@@ -562,7 +526,7 @@ fn review_reads_committed_symlink_text_without_target_contents() {
     let fixture = Fixture::start(repo.path(), false);
     let plan = tempfile::NamedTempFile::with_suffix(".md").unwrap();
     std::fs::write(plan.path(), "EXTERNAL_SYMLINK").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+    let output = fixture_command(env!("CARGO_BIN_EXE_crabber-implement"))
         .arg(plan.path())
         .arg("--repo")
         .arg(repo.path())
@@ -573,7 +537,6 @@ fn review_reads_committed_symlink_text_without_target_contents() {
         .arg("--session-timeout")
         .arg("20")
         .env("HOME", repo.path())
-        .env("OPENCODE_GO_API_KEY", "fixture-key")
         .env("CRABBER_IMPLEMENT_NO_TELEMETRY", "true")
         .output()
         .unwrap();
@@ -600,7 +563,7 @@ fn long_turn_run(
         "LONG_TURNS Create hello.txt after a long tool journey.",
     )
     .unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_crabber-implement"));
+    let mut command = fixture_command(env!("CARGO_BIN_EXE_crabber-implement"));
     command
         .arg(plan.path())
         .arg("--repo")
@@ -614,7 +577,6 @@ fn long_turn_run(
         .args(extra_args)
         .env_remove("CRABBER_IMPLEMENT_MAX_TURNS")
         .env("HOME", repo)
-        .env("OPENCODE_GO_API_KEY", "fixture-key")
         .env("CRABBER_IMPLEMENT_NO_TELEMETRY", "true");
     if let Some(value) = max_turns_env {
         command.env("CRABBER_IMPLEMENT_MAX_TURNS", value);
@@ -685,7 +647,7 @@ fn cli_streams_live_artifacts_before_completion() {
     let fixture = Fixture::start(repo.path(), false);
     let plan = tempfile::NamedTempFile::with_suffix(".md").unwrap();
     std::fs::write(plan.path(), "LIVE_ARTIFACTS Create hello.txt.").unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+    let mut child = fixture_command(env!("CARGO_BIN_EXE_crabber-implement"))
         .arg(plan.path())
         .arg("--repo")
         .arg(repo.path())
@@ -695,7 +657,6 @@ fn cli_streams_live_artifacts_before_completion() {
         .arg(format!("http://{}", fixture.address))
         .arg("--session-timeout")
         .arg("180")
-        .env("OPENCODE_GO_API_KEY", "fixture-key")
         .env("CRABBER_IMPLEMENT_NO_TELEMETRY", "true")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -735,7 +696,7 @@ fn cli_streams_live_artifacts_before_completion() {
             .unwrap()
     };
     let metadata = read_metadata();
-    assert_eq!(metadata["version"], 2);
+    assert_eq!(metadata["version"], 3);
     assert_eq!(
         metadata["run_id"],
         artifacts.file_name().unwrap().to_str().unwrap()
@@ -748,7 +709,7 @@ fn cli_streams_live_artifacts_before_completion() {
         metadata["branch"],
         git(repo.path(), &["branch", "--show-current"]).trim()
     );
-    assert_eq!(metadata["model"], "glm-5.2");
+    assert_eq!(metadata["model"], "gpt-5.6-terra");
     let first_heartbeat = metadata["heartbeat_at_ms"].as_u64().unwrap();
     wait_until(|| read_metadata()["heartbeat_at_ms"].as_u64().unwrap() > first_heartbeat);
     export_artifacts(&artifacts, "live");
@@ -879,7 +840,7 @@ fn explicit_turn_budget_fails_with_preserved_evidence() {
     assert_eq!(evidence["observed_turns"], 3);
     assert_eq!(evidence["status"], "failed");
     assert!(evidence["error"].as_str().unwrap().contains("turn limit"));
-    assert!(!evidence.to_string().contains("fixture-key"));
+    assert!(!evidence.to_string().contains("fixture-signature"));
     let artifacts = run_artifacts(repo.path());
     assert!(artifacts.join("implement.txt").is_file());
     let tool_log = std::fs::read_to_string(artifacts.join("implement.tools.txt")).unwrap();
@@ -897,7 +858,7 @@ fn environment_turn_budget_is_used_and_zero_is_rejected() {
     assert_eq!(evidence["max_turns"], 2);
     assert_eq!(evidence["observed_turns"], 2);
     for args in [vec!["--max-turns", "0"], vec![]] {
-        let output = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
+        let output = fixture_command(env!("CARGO_BIN_EXE_crabber-implement"))
             .arg("/does/not/exist.md")
             .args(args)
             .env("CRABBER_IMPLEMENT_MAX_TURNS", "0")
@@ -916,7 +877,7 @@ fn completion_run(
 ) -> std::process::Output {
     let plan = tempfile::NamedTempFile::with_suffix(".md").unwrap();
     std::fs::write(plan.path(), scenario).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_crabber-implement"));
+    let mut command = fixture_command(env!("CARGO_BIN_EXE_crabber-implement"));
     if !args.contains(&"--session-timeout") {
         command.args(["--session-timeout", "20"]);
     }
@@ -929,7 +890,6 @@ fn completion_run(
         .arg("--base-url")
         .arg(format!("http://{}", fixture.address))
         .args(args)
-        .env("OPENCODE_GO_API_KEY", "fixture-key")
         .env("CRABBER_IMPLEMENT_NO_TELEMETRY", "true")
         .output()
         .unwrap()
@@ -953,7 +913,10 @@ fn reasoning_only_completion_continues_the_same_stage_session() {
     assert_eq!(evidence["continuation_count"], 1);
     assert_eq!(evidence["runs"].as_array().unwrap().len(), 2);
     assert_eq!(evidence["observed_turns"], 4);
-    assert_eq!(evidence["runs"][0]["responses"][1]["finish_reason"], "stop");
+    assert_eq!(
+        evidence["runs"][0]["responses"][1]["finish_reason"],
+        Value::Null
+    );
     assert_eq!(
         evidence["runs"][0]["responses"][1]["has_visible_text"],
         false
@@ -969,6 +932,15 @@ fn reasoning_only_completion_continues_the_same_stage_session() {
     assert_ne!(evidence["runs"][0]["run_id"], evidence["runs"][1]["run_id"]);
     export_artifacts(&run_artifacts(repo.path()), "completion");
     let history = fixture.history.lock().unwrap();
+    assert!(
+        history[2]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "reasoning"
+                && item["encrypted_content"] == "fixture-encrypted-reasoning"),
+        "Codex continuation lost encrypted reasoning state"
+    );
     let resumed = &history[2]["messages"];
     assert_eq!(
         resumed
@@ -1057,19 +1029,6 @@ fn truncated_tools_and_filtered_responses_never_retry_or_execute_tools() {
 }
 
 #[test]
-fn length_without_tool_calls_can_continue_and_complete() {
-    let repo = repository();
-    let fixture = Fixture::start(repo.path(), false);
-    let output = completion_run(repo.path(), &fixture, "COMPLETION_LENGTH", &[]);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(session_evidence(repo.path())["continuation_count"], 1);
-}
-
-#[test]
 fn explicit_blocker_preserves_its_explanation_and_never_commits() {
     let repo = repository();
     let fixture = Fixture::start(repo.path(), false);
@@ -1088,67 +1047,64 @@ fn explicit_blocker_preserves_its_explanation_and_never_commits() {
 
 #[test]
 fn continuations_share_one_absolute_deadline() {
-    for scenario in ["COMPLETION_DELAY", "COMPLETION_BUDGET_DELAY"] {
-        let repo = repository();
-        let fixture = Fixture::start(repo.path(), false);
-        let output = completion_run(repo.path(), &fixture, scenario, &["--session-timeout", "3"]);
-        assert!(!output.status.success());
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("exceeded 3 seconds"),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(fixture.implementation_requests.load(Ordering::Relaxed), 2);
-        let evidence = session_evidence(repo.path());
-        assert_eq!(evidence["continuation_count"], 1);
-        assert_eq!(evidence["status"], "failed");
-    }
+    let scenario = "COMPLETION_DELAY";
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let output = completion_run(repo.path(), &fixture, scenario, &["--session-timeout", "3"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("exceeded 3 seconds"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.implementation_requests.load(Ordering::Relaxed), 2);
+    let evidence = session_evidence(repo.path());
+    assert_eq!(evidence["continuation_count"], 1);
+    assert_eq!(evidence["status"], "failed");
 }
 
 #[test]
 fn cancellation_during_continuation_never_replays_the_stage() {
-    for scenario in ["COMPLETION_CANCEL", "COMPLETION_BUDGET_CANCEL"] {
-        let repo = repository();
-        let fixture = Fixture::start(repo.path(), false);
-        let plan = tempfile::NamedTempFile::with_suffix(".md").unwrap();
-        std::fs::write(plan.path(), scenario).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_crabber-implement"))
-            .arg(plan.path())
-            .arg("--repo")
-            .arg(repo.path())
-            .arg("--skills-dir")
-            .arg(repo.path().join(".git/fixture-skills"))
-            .arg("--base-url")
-            .arg(format!("http://{}", fixture.address))
-            .arg("--session-timeout")
-            .arg("20")
-            .env("OPENCODE_GO_API_KEY", "fixture-key")
-            .env("CRABBER_IMPLEMENT_NO_TELEMETRY", "true")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        wait_until(|| fixture.implementation_requests.load(Ordering::Relaxed) == 2);
-        let recovering = session_evidence(repo.path());
-        assert_eq!(recovering["status"], "running");
-        assert_eq!(recovering["continuation_count"], 1);
-        assert_eq!(recovering["runs"].as_array().unwrap().len(), 2);
-        assert!(
-            Command::new("kill")
-                .args(["-INT", &child.id().to_string()])
-                .status()
-                .unwrap()
-                .success()
-        );
-        let output = child.wait_with_output().unwrap();
-        assert!(!output.status.success());
-        assert_eq!(fixture.implementation_requests.load(Ordering::Relaxed), 2);
-        assert_eq!(session_evidence(repo.path())["status"], "failed");
-        assert_eq!(
-            git(repo.path(), &["rev-list", "--count", "main..HEAD"]).trim(),
-            "0"
-        );
-    }
+    let scenario = "COMPLETION_CANCEL";
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let plan = tempfile::NamedTempFile::with_suffix(".md").unwrap();
+    std::fs::write(plan.path(), scenario).unwrap();
+    let child = fixture_command(env!("CARGO_BIN_EXE_crabber-implement"))
+        .arg(plan.path())
+        .arg("--repo")
+        .arg(repo.path())
+        .arg("--skills-dir")
+        .arg(repo.path().join(".git/fixture-skills"))
+        .arg("--base-url")
+        .arg(format!("http://{}", fixture.address))
+        .arg("--session-timeout")
+        .arg("20")
+        .env("CRABBER_IMPLEMENT_NO_TELEMETRY", "true")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until(|| fixture.implementation_requests.load(Ordering::Relaxed) == 2);
+    let recovering = session_evidence(repo.path());
+    assert_eq!(recovering["status"], "running");
+    assert_eq!(recovering["continuation_count"], 1);
+    assert_eq!(recovering["runs"].as_array().unwrap().len(), 2);
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(fixture.implementation_requests.load(Ordering::Relaxed), 2);
+    assert_eq!(session_evidence(repo.path())["status"], "failed");
+    assert_eq!(
+        git(repo.path(), &["rev-list", "--count", "main..HEAD"]).trim(),
+        "0"
+    );
 }
 
 #[test]
@@ -1202,295 +1158,6 @@ fn failed_stream_text_cannot_become_the_final_answer() {
                 .contains("stale failed response")
         );
     }
-}
-
-#[test]
-fn output_budget_recovers_only_after_transmitting_a_larger_cap() {
-    let repo = repository();
-    let fixture = Fixture::start(repo.path(), false);
-    let output = completion_run(repo.path(), &fixture, "COMPLETION_CAP_RECOVER", &[]);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        std::fs::read_to_string(repo.path().join("hello.txt")).unwrap(),
-        "fixed\n"
-    );
-    let evidence = session_evidence(repo.path());
-    assert_eq!(evidence["continuation_count"], 1);
-    export_artifacts(&run_artifacts(repo.path()), "output-budget-success");
-    let history = fixture.history.lock().unwrap();
-    let implementation: Vec<_> = history
-        .iter()
-        .filter(|body| {
-            let text = body.to_string();
-            text.contains("COMPLETION_CAP_RECOVER")
-                && !text.contains("Perform your assigned independent review")
-                && !text.contains("Execute the following fix-review skill")
-                && !text.contains("Summarize this context for continuation")
-        })
-        .collect();
-    assert_eq!(implementation[0]["max_tokens"], 16384);
-    assert_eq!(implementation[1]["max_tokens"], 32768);
-    assert!(
-        implementation[1]["messages"]
-            .to_string()
-            .contains("COMPLETION_CAP_RECOVER")
-    );
-    assert!(
-        !std::fs::read_to_string(run_artifacts(repo.path()).join("implement.txt"))
-            .unwrap()
-            .contains("Private output budget sentinel")
-    );
-}
-
-fn output_length() -> Value {
-    json!({"choices":[{"index":0,"delta":{"reasoning_content":"Private output budget sentinel"},"finish_reason":"length"}],"usage":{"prompt_tokens":20,"completion_tokens":16384}})
-}
-
-fn output_caps(evidence: &Value) -> Vec<u64> {
-    evidence["runs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|run| run["requested_max_output_tokens"].as_u64().unwrap())
-        .collect()
-}
-
-#[test]
-fn output_budget_reaches_the_third_attempt_and_mixed_recovery_keeps_its_cap() {
-    for (scenario, caps) in [
-        ("COMPLETION_BUDGET_THIRD", vec![16384, 32768, 65536]),
-        ("COMPLETION_BUDGET_MIXED", vec![16384, 16384, 32768]),
-    ] {
-        let repo = repository();
-        let fixture = Fixture::start(repo.path(), false);
-        let output = completion_run(repo.path(), &fixture, scenario, &[]);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let evidence = session_evidence(repo.path());
-        assert_eq!(output_caps(&evidence), caps);
-        assert_eq!(evidence["continuation_count"], 2);
-        assert_eq!(
-            std::fs::read_to_string(repo.path().join("hello.txt")).unwrap(),
-            "fixed\n"
-        );
-    }
-}
-
-#[test]
-fn output_budget_exhaustion_is_bounded_and_preserves_successful_edits() {
-    for (scenario, args, caps, reason) in [
-        (
-            "COMPLETION_BUDGET_ALWAYS",
-            vec![],
-            vec![16384, 32768, 65536],
-            "output ceiling",
-        ),
-        (
-            "COMPLETION_BUDGET_ALWAYS",
-            vec![
-                "--max-output-tokens",
-                "20000",
-                "--max-recovery-output-tokens",
-                "50000",
-            ],
-            vec![20000, 40000, 50000],
-            "output ceiling",
-        ),
-        (
-            "COMPLETION_BUDGET_ALWAYS",
-            vec![
-                "--max-output-tokens",
-                "32768",
-                "--max-recovery-output-tokens",
-                "32768",
-            ],
-            vec![32768],
-            "output ceiling",
-        ),
-        (
-            "COMPLETION_BUDGET_ALWAYS",
-            vec!["--max-recovery-output-tokens", "262144"],
-            vec![16384, 32768, 65536],
-            "continuation allowance",
-        ),
-        (
-            "COMPLETION_BUDGET_PRESERVE",
-            vec![],
-            vec![16384, 32768, 65536],
-            "output ceiling",
-        ),
-        (
-            "COMPLETION_BUDGET_MIXED_EXHAUST",
-            vec![],
-            vec![16384, 32768, 32768],
-            "continuation allowance",
-        ),
-    ] {
-        let repo = repository();
-        let original_head = git(repo.path(), &["rev-parse", "HEAD"]);
-        let fixture = Fixture::start(repo.path(), false);
-        let output = completion_run(repo.path(), &fixture, scenario, &args);
-        assert!(!output.status.success());
-        let error = String::from_utf8_lossy(&output.stderr);
-        assert!(error.contains("exhausted output-limit recovery"), "{error}");
-        assert!(error.contains(reason), "{error}");
-        assert!(error.contains("--max-recovery-output-tokens"), "{error}");
-        let evidence = session_evidence(repo.path());
-        assert_eq!(output_caps(&evidence), caps);
-        assert_eq!(
-            evidence["runs"].as_array().unwrap().last().unwrap()["status"],
-            "failed"
-        );
-        assert_eq!(
-            evidence["runs"].as_array().unwrap().last().unwrap()["continuation_cause"],
-            "output_limit"
-        );
-        assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), original_head);
-        let history = fixture.history.lock().unwrap();
-        assert!(!history.iter().any(|request| {
-            request
-                .to_string()
-                .contains("Perform your assigned independent review")
-        }));
-        let transmitted: Vec<_> = history
-            .iter()
-            .map(|request| request["max_tokens"].as_u64().unwrap())
-            .collect();
-        let expected = if scenario.contains("PRESERVE") {
-            vec![16384, 16384, 32768, 65536]
-        } else {
-            caps
-        };
-        assert_eq!(transmitted, expected);
-        if scenario.contains("PRESERVE") {
-            export_artifacts(&run_artifacts(repo.path()), "output-budget-exhausted");
-            assert_eq!(
-                std::fs::read_to_string(repo.path().join("hello.txt")).unwrap(),
-                "partial work\n"
-            );
-            assert!(git(repo.path(), &["status", "--porcelain"]).contains("hello.txt"));
-        }
-        assert!(
-            !serde_json::to_string(&evidence)
-                .unwrap()
-                .contains("Private output budget sentinel")
-        );
-    }
-}
-
-#[test]
-fn output_budget_invalid_flags_do_not_mutate_repository_or_contact_provider() {
-    for args in [
-        vec!["--max-output-tokens", "0"],
-        vec!["--max-recovery-output-tokens", "0"],
-        vec!["--max-output-tokens", "-1"],
-        vec!["--max-output-tokens", "4294967296"],
-        vec!["--max-output-tokens", "65537"],
-    ] {
-        let repo = repository();
-        let head = git(repo.path(), &["rev-parse", "HEAD"]);
-        let fixture = Fixture::start(repo.path(), false);
-        let output = completion_run(repo.path(), &fixture, "COMPLETION_CAP_RECOVER", &args);
-        assert!(!output.status.success());
-        assert!(fixture.history.lock().unwrap().is_empty());
-        assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), head);
-        assert_eq!(
-            git(repo.path(), &["branch", "--show-current"]).trim(),
-            "main"
-        );
-        assert!(!repo.path().join(".git/crabber-implement").exists());
-    }
-}
-
-#[test]
-fn output_budget_provider_rejection_and_turn_exhaustion_never_retry_again() {
-    for (scenario, args, expected) in [
-        ("COMPLETION_BUDGET_REJECT", vec![], vec![16384, 32768]),
-        (
-            "COMPLETION_BUDGET_ALWAYS",
-            vec!["--max-turns", "1"],
-            vec![16384],
-        ),
-    ] {
-        let repo = repository();
-        let fixture = Fixture::start(repo.path(), false);
-        let output = completion_run(repo.path(), &fixture, scenario, &args);
-        assert!(!output.status.success());
-        let evidence = session_evidence(repo.path());
-        assert_eq!(output_caps(&evidence), expected);
-        assert_eq!(fixture.history.lock().unwrap().len(), expected.len());
-        let error = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            error.contains(if scenario.contains("REJECT") {
-                "fixture rejects requested output cap"
-            } else {
-                "turn limit"
-            }),
-            "{error}"
-        );
-        assert_eq!(
-            evidence["runs"].as_array().unwrap().last().unwrap()["status"],
-            "failed"
-        );
-    }
-}
-
-#[test]
-fn output_budget_is_independent_in_implementation_review_and_fix_sessions() {
-    let repo = repository();
-    let fixture = Fixture::start(repo.path(), false);
-    let output = completion_run(repo.path(), &fixture, "COMPLETION_BUDGET_STAGES", &[]);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let artifacts = run_artifacts(repo.path());
-    let mut count = 0;
-    for file in std::fs::read_dir(&artifacts).unwrap() {
-        let file = file.unwrap().path();
-        if file.to_string_lossy().ends_with(".session.json") {
-            let evidence: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
-            assert_eq!(output_caps(&evidence), vec![16384, 32768]);
-            assert_eq!(evidence["runs"][0]["continuation_cause"], "output_limit");
-            assert_eq!(evidence["runs"][1]["continuation_cause"], Value::Null);
-            count += 1;
-        }
-    }
-    assert_eq!(count, 6);
-}
-
-#[test]
-fn output_budget_never_escalates_compaction_summary_truncation() {
-    let repo = repository();
-    let head = git(repo.path(), &["rev-parse", "HEAD"]);
-    let fixture = Fixture::start(repo.path(), false);
-    let output = completion_run(repo.path(), &fixture, "COMPLETION_SUMMARY_LENGTH", &[]);
-    assert!(!output.status.success());
-    let error = String::from_utf8_lossy(&output.stderr);
-    assert!(error.contains("model output limit reached"), "{error}");
-    let evidence = session_evidence(repo.path());
-    assert_eq!(output_caps(&evidence), vec![16384]);
-    assert_eq!(evidence["continuation_count"], 0);
-    assert_eq!(evidence["runs"][0]["continuation_cause"], Value::Null);
-    assert_eq!(evidence["runs"][0]["status"], "failed");
-    let history = fixture.history.lock().unwrap();
-    assert_eq!(history.len(), 3);
-    assert!(
-        history
-            .last()
-            .unwrap()
-            .to_string()
-            .contains("Summarize this context for continuation")
-    );
-    assert_eq!(git(repo.path(), &["rev-parse", "HEAD"]), head);
 }
 
 #[test]
@@ -1731,7 +1398,7 @@ fn trace_attribute(attributes: &[KeyValue], name: &str) -> Option<String> {
 }
 
 fn telemetry_command(repo: &Path, fixture: &Fixture, plan: &Path, endpoint: &str) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_crabber-implement"));
+    let mut command = fixture_command(env!("CARGO_BIN_EXE_crabber-implement"));
     command
         .arg(plan)
         .arg("--repo")
@@ -1741,7 +1408,6 @@ fn telemetry_command(repo: &Path, fixture: &Fixture, plan: &Path, endpoint: &str
         .arg("--base-url")
         .arg(format!("http://{}", fixture.address))
         .args(["--session-timeout", "20"])
-        .env("OPENCODE_GO_API_KEY", "PRIVATE_TELEMETRY_KEY_SENTINEL")
         .env("DD_API_KEY", "PRIVATE_AGENTLESS_KEY_SENTINEL")
         .env("CRABBER_IMPLEMENT_NO_TELEMETRY", "false")
         .env("OTEL_SDK_DISABLED", "false")
@@ -1823,7 +1489,36 @@ fn telemetry_exports_correlated_workflow_sessions_attempts_and_sdk_spans_without
     ] {
         assert!(spans.iter().any(|span| span.name == name), "missing {name}");
     }
+    let dispatch_sessions: Vec<_> = std::fs::read_dir(run_artifacts(repo.path()))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.to_string_lossy().ends_with(".session.json"))
+        .map(|path| serde_json::from_slice::<Value>(&std::fs::read(path).unwrap()).unwrap())
+        .filter(|session| session["provider"] == "local-review-dispatch")
+        .map(|session| session["session_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(dispatch_sessions.len(), 2);
     for span in &spans {
+        let local_dispatch = trace_attribute(&span.attributes, "session.id")
+            .is_some_and(|id| dispatch_sessions.contains(&id));
+        if span.name == "crabber.model_call" && local_dispatch {
+            assert_eq!(
+                trace_attribute(&span.attributes, "provider.id").as_deref(),
+                Some("local-review-dispatch")
+            );
+            assert_eq!(
+                trace_attribute(&span.attributes, "model.id").as_deref(),
+                Some("v1")
+            );
+            assert!(matches!(
+                trace_attribute(&span.attributes, "tokens.input").as_deref(),
+                None | Some("0")
+            ));
+            assert!(matches!(
+                trace_attribute(&span.attributes, "tokens.output").as_deref(),
+                None | Some("0")
+            ));
+        }
         if span.name.starts_with("implement.")
             || matches!(
                 span.name.as_str(),
@@ -1854,6 +1549,7 @@ fn telemetry_exports_correlated_workflow_sessions_attempts_and_sdk_spans_without
                 }
                 "implement.session" | "implement.reviewer" => "implement.stage",
                 "implement.attempt" => "implement.session",
+                "crabber.run" if local_dispatch => "implement.stage",
                 _ => "implement.attempt",
             };
             assert_eq!(parent.name, expected, "parent of {}", span.name);
@@ -1888,6 +1584,7 @@ fn telemetry_exports_correlated_workflow_sessions_attempts_and_sdk_spans_without
         let body = String::from_utf8_lossy(&body);
         for sentinel in [
             "PRIVATE_TELEMETRY",
+            "fixture-signature",
             "PRIVATE_AGENTLESS",
             "Private fixture reasoning",
             "Fixture project",
@@ -2129,100 +1826,12 @@ fn telemetry_health_does_not_claim_delivery_when_sampled_out_or_partially_reject
     }
 }
 
-#[test]
-fn transport_outage_recovers_without_replaying_tools_or_starting_a_continuation() {
-    let repo = repository();
-    let fixture = Fixture::start(repo.path(), false);
-    let started = std::time::Instant::now();
-    let intake = TraceIntake::start(TraceReply::Accepted);
-    let plan = tempfile::NamedTempFile::with_suffix(".md").unwrap();
-    std::fs::write(plan.path(), "TRANSPORT_RECOVER").unwrap();
-    let output = telemetry_command(repo.path(), &fixture, plan.path(), &intake.endpoint)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(started.elapsed() >= Duration::from_secs(15));
-    assert_eq!(
-        std::fs::read_to_string(repo.path().join("hello.txt")).unwrap(),
-        "fixed\n"
-    );
-    let history = fixture.history.lock().unwrap();
-    assert!(history.len() >= 6);
-    assert!(history[1..6].windows(2).all(|pair| pair[0] == pair[1]));
-    drop(history);
-    let artifact = run_artifacts(repo.path());
-    let session: Value =
-        serde_json::from_slice(&std::fs::read(artifact.join("implement.session.json")).unwrap())
-            .unwrap();
-    assert_eq!(session["continuation_count"], 0);
-    assert_eq!(session["observed_turns"], 2);
-    export_artifacts(&artifact, "transport-recovered");
-    let spans = intake.spans();
-    let failed: Vec<_> = spans
-        .iter()
-        .filter(|span| {
-            span.name == "crabber.provider.request"
-                && trace_attribute(&span.attributes, "outcome").as_deref()
-                    == Some("transport_error")
-        })
-        .collect();
-    assert_eq!(failed.len(), 4);
-    for span in failed {
-        assert_eq!(
-            trace_attribute(&span.attributes, "transport.phase").as_deref(),
-            Some("request")
-        );
-        assert_eq!(
-            trace_attribute(&span.attributes, "transport.cause").as_deref(),
-            Some("request")
-        );
-        assert_eq!(
-            trace_attribute(&span.attributes, "transport.protocol_code").as_deref(),
-            Some("http_incomplete_message")
-        );
-        assert_eq!(
-            trace_attribute(&span.attributes, "transport.chain_status").as_deref(),
-            Some("complete")
-        );
-    }
-    let exported = format!("{spans:?}");
-    for secret in [
-        fixture.address.as_str(),
-        "PRIVATE_TELEMETRY_KEY_SENTINEL",
-        "PRIVATE_AGENTLESS_KEY_SENTINEL",
-        "TRANSPORT_RECOVER",
-    ] {
-        assert!(!exported.contains(secret));
-    }
-}
-
-#[test]
-fn session_deadline_interrupts_transport_backoff() {
-    let repo = repository();
-    let fixture = Fixture::start(repo.path(), false);
-    let started = std::time::Instant::now();
-    let output = completion_run(
-        repo.path(),
-        &fixture,
-        "TRANSPORT_OUTAGE",
-        &["--session-timeout", "2"],
-    );
-    assert!(!output.status.success());
-    assert!(started.elapsed() < Duration::from_secs(6));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("session exceeded 2 seconds"));
-    assert!(!repo.path().join("hello.txt").exists());
-}
-
 fn recovery_command(repo: &Path, fixture: &Fixture, plan: &Path) -> Command {
     recovery_command_timeout(repo, fixture, plan, "30")
 }
 
 fn recovery_command_timeout(repo: &Path, fixture: &Fixture, plan: &Path, timeout: &str) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_crabber-implement"));
+    let mut command = fixture_command(env!("CARGO_BIN_EXE_crabber-implement"));
     command
         .arg(plan)
         .arg("--repo")
@@ -2232,7 +1841,6 @@ fn recovery_command_timeout(repo: &Path, fixture: &Fixture, plan: &Path, timeout
         .arg("--base-url")
         .arg(format!("http://{}", fixture.address))
         .args(["--session-timeout", timeout])
-        .env("OPENCODE_GO_API_KEY", "fixture-key")
         .env("CRABBER_IMPLEMENT_NO_TELEMETRY", "true");
     command
 }
@@ -2330,7 +1938,17 @@ fn review_recovery_rejects_stale_profiles_corruption_and_fix_intent_without_call
     let state: Value = serde_json::from_slice(&original).unwrap();
     let id = state["workflow_id"].as_str().unwrap();
     let requests = fixture.history.lock().unwrap().len();
-    for field in ["model", "branch", "base", "executable", "plan", "skill"] {
+    for field in [
+        "provider_profile",
+        "protocol",
+        "reasoning_effort",
+        "model",
+        "branch",
+        "base",
+        "executable",
+        "plan",
+        "skill",
+    ] {
         let mut changed = state.clone();
         changed["inputs"][field] = "different".into();
         std::fs::write(artifacts.join("review-state.json"), changed.to_string()).unwrap();
@@ -2340,6 +1958,24 @@ fn review_recovery_rejects_stale_profiles_corruption_and_fix_intent_without_call
             .unwrap();
         assert!(!output.status.success(), "accepted stale {field}");
         assert_eq!(fixture.history.lock().unwrap().len(), requests);
+    }
+    assert_eq!(state["version"], 3);
+    for version in [1, 2] {
+        let mut changed = state.clone();
+        changed["version"] = version.into();
+        std::fs::write(artifacts.join("review-state.json"), changed.to_string()).unwrap();
+        for mode in ["--resume-review", "--refresh-review"] {
+            let output = recovery_command(repo.path(), &fixture, &plan)
+                .args([mode, id])
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "accepted checkpoint version {version}"
+            );
+            assert!(String::from_utf8_lossy(&output.stderr).contains("version"));
+            assert_eq!(fixture.history.lock().unwrap().len(), requests);
+        }
     }
     for phase in ["fix_intent_recorded", "fix_committed", "completed"] {
         let mut changed = state.clone();
@@ -2484,7 +2120,7 @@ fn telemetry_review_recovery_reuses_without_fabricating_model_spans() {
     );
     let rendered = format!("{spans:?}");
     for secret in [
-        "PRIVATE_TELEMETRY_KEY_SENTINEL",
+        "fixture-signature",
         "PRIVATE_AGENTLESS_KEY_SENTINEL",
         "REVIEW_BAD_REPORT",
     ] {
@@ -2638,9 +2274,10 @@ fn review_recovery_cached_reports_require_credentials_only_for_fixes() {
         )
         .unwrap();
         let calls = fixture.history.lock().unwrap().len();
-        let second = recovery_command(repo.path(), &fixture, &plan)
+        let mut command = recovery_command(repo.path(), &fixture, &plan);
+        remove_auth(&mut command);
+        let second = command
             .args(["--resume-review", state["workflow_id"].as_str().unwrap()])
-            .env_remove("OPENCODE_GO_API_KEY")
             .output()
             .unwrap();
         assert_eq!(
@@ -2655,7 +2292,7 @@ fn review_recovery_cached_reports_require_credentials_only_for_fixes() {
             "cached reports made model calls"
         );
         if !approved {
-            assert!(String::from_utf8_lossy(&second.stderr).contains("export OPENCODE_GO_API_KEY"));
+            assert!(String::from_utf8_lossy(&second.stderr).contains("codex login"));
             assert_eq!(
                 std::fs::read(artifacts.join("review-state.json")).unwrap(),
                 state_bytes

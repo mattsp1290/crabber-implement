@@ -1,18 +1,22 @@
 use anyhow::{Context, Result, bail};
 use crabber::{
     Agent, AgentConfig, EventKind, PermissionDecision, RuntimeError, Selection, StaticPolicy,
-    core::RunStatus,
-    extension::Scope,
-    providers::{HttpAdapter, HttpResolver, Protocol},
+    core::RunStatus, extension::Scope,
 };
 use crabber_tools_catalog::prelude::*;
-use std::{fs, io::Write, path::Path, sync::Arc, time::Duration};
+use std::{
+    fs,
+    io::{Seek, Write},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use crate::config::RunConfig;
 #[derive(Clone)]
 pub enum SessionMode {
     Mutable,
-    Review(crate::review_inputs::ReviewSnapshot),
+    Review(crate::review_inputs::ReviewSnapshot, ParentDelegation),
 }
 
 use tracing::Instrument;
@@ -25,16 +29,11 @@ const CONTINUATION_PROMPT: &str = "Continue the assigned task from the existing 
 #[serde(rename_all = "snake_case")]
 enum ContinuationCause {
     EmptyCompletion,
-    OutputLimit,
 }
 
 enum AttemptOutcome {
     Complete(String),
     Continue(ContinuationCause),
-}
-
-fn next_output_limit(current: u32, ceiling: u32) -> Option<u32> {
-    (current < ceiling).then(|| current.saturating_mul(2).min(ceiling))
 }
 
 #[derive(serde::Serialize)]
@@ -49,7 +48,6 @@ struct ResponseEvidence {
 struct AttemptEvidence {
     run_id: crabber::core::RunId,
     observed_turns: usize,
-    requested_max_output_tokens: u32,
     continuation_cause: Option<ContinuationCause>,
     responses: Vec<ResponseEvidence>,
     response_count: usize,
@@ -58,8 +56,27 @@ struct AttemptEvidence {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ParentDelegation {
+    session_id: crabber::SessionId,
+    run_id: crabber::core::RunId,
+    call_id: crabber::core::ToolCallId,
+}
+
+impl ParentDelegation {
+    pub(crate) fn from_request(request: &crabber_extensions::delegate_task::Request) -> Self {
+        Self {
+            session_id: request.session_id().clone(),
+            run_id: request.run_id().clone(),
+            call_id: request.call_id().clone(),
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 struct StageSession<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_delegation: Option<ParentDelegation>,
     name: &'a str,
     execution_generation: u64,
     review_round: Option<u32>,
@@ -73,10 +90,6 @@ struct StageSession<'a> {
     max_turns: usize,
     observed_turns: usize,
     continuation_count: usize,
-    max_output_tokens: u32,
-    max_recovery_output_tokens: u32,
-    #[serde(skip)]
-    current_output_tokens: u32,
     runs: Vec<AttemptEvidence>,
     status: &'static str,
     error: Option<String>,
@@ -114,6 +127,10 @@ pub(crate) async fn session_reserved(
         "otel.status_code" = tracing::field::Empty, "error.kind" = tracing::field::Empty);
     let identity = crate::review_checkpoint::session_identity(name);
     let mut stage = StageSession {
+        parent_delegation: match &mode {
+            SessionMode::Review(_, parent) => Some(parent.clone()),
+            SessionMode::Mutable => None,
+        },
         name,
         execution_generation: config.generation,
         review_round: identity.map(|v| v.0),
@@ -125,9 +142,6 @@ pub(crate) async fn session_reserved(
         max_turns: config.max_turns.get(),
         observed_turns: 0,
         continuation_count: 0,
-        max_output_tokens: config.output_budget.initial.get(),
-        max_recovery_output_tokens: config.output_budget.ceiling.get(),
-        current_output_tokens: config.output_budget.initial.get(),
         runs: Vec::new(),
         status: "running",
         error: None,
@@ -219,12 +233,10 @@ impl StageSession<'_> {
                 self.name,
                 mode.clone(),
                 remaining,
-                self.current_output_tokens,
                 self.store.clone(),
             )?;
             let attempt_span = tracing::info_span!("implement.attempt", "workflow.run_id" = %self.workflow_run_id,
                 "continuation.index" = self.continuation_count as u64,
-                "output.requested_cap" = self.current_output_tokens,
                 "session.id" = tracing::field::Empty, "run.id" = tracing::field::Empty,
                 "continuation.reason" = tracing::field::Empty, outcome = tracing::field::Empty, "otel.status_code" = tracing::field::Empty,
                 "error.kind" = tracing::field::Empty);
@@ -245,7 +257,6 @@ impl StageSession<'_> {
                     "continuation.reason",
                     match cause {
                         ContinuationCause::EmptyCompletion => "empty_completion",
-                        ContinuationCause::OutputLimit => "output_limit",
                     },
                 );
             } else {
@@ -263,37 +274,6 @@ impl StageSession<'_> {
                 return Err(self.turn_limit());
             }
             match cause {
-                ContinuationCause::OutputLimit => {
-                    let larger = next_output_limit(
-                        self.current_output_tokens,
-                        self.max_recovery_output_tokens,
-                    );
-                    let reason = if larger.is_none() {
-                        Some("output ceiling")
-                    } else if self.continuation_count == MAX_CONTINUATIONS {
-                        Some("continuation allowance")
-                    } else {
-                        None
-                    };
-                    if let Some(reason) = reason {
-                        bail!(
-                            "Crabber session {} exhausted output-limit recovery ({reason}); last requested per-response cap {}, configured ceiling {}, continuations {}/{}, observed turns {}/{}. Configure --max-output-tokens and --max-recovery-output-tokens for the provider. Requested caps may be clamped by the provider. Partial edits are preserved; see {}",
-                            self.name,
-                            self.current_output_tokens,
-                            self.max_recovery_output_tokens,
-                            self.continuation_count,
-                            MAX_CONTINUATIONS,
-                            self.observed_turns,
-                            self.max_turns,
-                            self.config.artifacts.display()
-                        );
-                    }
-                    self.current_output_tokens = larger.unwrap();
-                    next_prompt = format!(
-                        "The previous response reached its per-response output allowance. The new requested cap is {} tokens. {} Take a small concrete next tool action or return a factual final answer. Do not reproduce private reasoning.",
-                        self.current_output_tokens, CONTINUATION_PROMPT
-                    );
-                }
                 ContinuationCause::EmptyCompletion => {
                     if self.continuation_count == MAX_CONTINUATIONS {
                         bail!(
@@ -309,6 +289,110 @@ impl StageSession<'_> {
             self.continuation_count += 1;
             self.persist()?;
         }
+    }
+
+    fn observe_event(
+        &mut self,
+        event: &crabber::EventRecord,
+        text: &mut String,
+        transcript: &mut fs::File,
+        tool_log: &mut fs::File,
+        response_log: &mut fs::File,
+    ) -> Result<()> {
+        match event.kind {
+            EventKind::TurnStarted => {
+                self.observed_turns += 1;
+                self.runs.last_mut().unwrap().observed_turns += 1;
+                text.clear();
+                self.persist()?;
+            }
+            EventKind::MessageStarted => text.clear(),
+            EventKind::TextDelta => {
+                let delta = event.payload["text"].as_str().unwrap_or_default();
+                text.push_str(delta);
+                transcript
+                    .write_all(delta.as_bytes())
+                    .context("write session transcript")?;
+            }
+            EventKind::ToolCallSettled => {
+                writeln!(tool_log, "{}", event.payload).context("write session tool log")?
+            }
+            EventKind::ModelResponseCompleted => {
+                let attempt = self.runs.last_mut().unwrap();
+                let response = ResponseEvidence {
+                    run_id: attempt.run_id.clone(),
+                    observed_turn: self.observed_turns,
+                    completion: serde_json::from_value(event.payload.clone())
+                        .context("decode model completion evidence")?,
+                };
+                writeln!(response_log, "{}", serde_json::to_string(&response)?)
+                    .context("write model response evidence")?;
+                attempt.response_count += 1;
+                attempt.responses.push(response);
+                if attempt.responses.len() > RESPONSE_SUMMARY_LIMIT {
+                    attempt.responses.remove(0);
+                    attempt.responses_truncated = true;
+                }
+                self.persist()?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn reconcile_observation(
+        &mut self,
+        transcript: &mut fs::File,
+        tool_log: &mut fs::File,
+        response_log: &mut fs::File,
+        tool_offset: u64,
+        response_offset: u64,
+    ) -> Result<String> {
+        use crabber::session::Store;
+        let session_id = self
+            .session_id
+            .clone()
+            .context("missing admitted session")?;
+        let run_id = self.run_id.clone().context("missing admitted run")?;
+        let attempt = self.runs.last_mut().context("missing attempt")?;
+        self.observed_turns -= attempt.observed_turns;
+        attempt.observed_turns = 0;
+        attempt.responses.clear();
+        attempt.response_count = 0;
+        attempt.responses_truncated = false;
+        tool_log.set_len(tool_offset)?;
+        tool_log.seek(std::io::SeekFrom::Start(tool_offset))?;
+        response_log.set_len(response_offset)?;
+        response_log.seek(std::io::SeekFrom::Start(response_offset))?;
+        let mut last_cursor = None;
+        let mut ignored_text = String::new();
+        loop {
+            let events = self
+                .store
+                .list_events(&session_id, last_cursor, 256)
+                .await?;
+            if events.is_empty() {
+                break;
+            }
+            for event in events {
+                last_cursor = event.cursor;
+                if event.run_id == run_id {
+                    self.observe_event(
+                        &event,
+                        &mut ignored_text,
+                        transcript,
+                        tool_log,
+                        response_log,
+                    )?;
+                }
+            }
+        }
+        let text = committed_answer(&self.store, &session_id, &run_id).await?;
+        writeln!(
+            transcript,
+            "\n[Live observation lagged; recovered committed final answer]\n{text}"
+        )?;
+        Ok::<_, anyhow::Error>(text)
     }
 
     async fn attempt(
@@ -353,7 +437,6 @@ impl StageSession<'_> {
         self.runs.push(AttemptEvidence {
             run_id: run.run_id().clone(),
             observed_turns: 0,
-            requested_max_output_tokens: self.current_output_tokens,
             continuation_cause: None,
             responses: Vec::new(),
             response_count: 0,
@@ -361,7 +444,10 @@ impl StageSession<'_> {
             status: "running",
             error: None,
         });
-        let outcome = async {
+        let tool_offset = tool_log.stream_position()?;
+        let response_offset = response_log.stream_position()?;
+        let mut observation_lagged = false;
+        let mut outcome = async {
             self.persist()?;
             let mut events = run.events();
             let mut text = String::new();
@@ -370,37 +456,15 @@ impl StageSession<'_> {
                     biased;
                     _ = cancel.cancelled() => bail!("session cancelled"),
                     _ = tokio::time::sleep_until(self.deadline) => bail!("session exceeded {} seconds", self.config.session_timeout.as_secs()),
-                    event = events.recv() => event?,
+                    event = events.recv() => match event {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => { observation_lagged = true; break; }
+                        Err(error) => return Err(error.into()),
+                    },
                 };
                 let Some(event) = event else { break };
-                match event.kind {
-                    EventKind::TurnStarted => {
-                        self.observed_turns += 1;
-                        self.runs.last_mut().unwrap().observed_turns += 1;
-                        text.clear();
-                        self.persist()?;
-                    }
-                    EventKind::MessageStarted => text.clear(),
-                    EventKind::TextDelta => {
-                        let delta = event.payload["text"].as_str().unwrap_or_default();
-                        text.push_str(delta);
-                        transcript.write_all(delta.as_bytes()).context("write session transcript")?;
-                    }
-                    EventKind::ToolCallSettled => writeln!(tool_log, "{}", event.payload).context("write session tool log")?,
-                    EventKind::ModelResponseCompleted => {
-                        let attempt = self.runs.last_mut().unwrap();
-                        let response = ResponseEvidence { run_id: attempt.run_id.clone(), observed_turn: self.observed_turns, completion: serde_json::from_value(event.payload.clone()).context("decode model completion evidence")? };
-                        writeln!(response_log, "{}", serde_json::to_string(&response)?).context("write model response evidence")?;
-                        attempt.response_count += 1;
-                        attempt.responses.push(response);
-                        if attempt.responses.len() > RESPONSE_SUMMARY_LIMIT {
-                            attempt.responses.remove(0);
-                            attempt.responses_truncated = true;
-                        }
-                        self.persist()?;
-                    }
-                    _ => {}
-                }
+                self.observe_event(&event, &mut text, transcript, tool_log, response_log)?;
+
             }
             Ok(text)
         }.await;
@@ -416,6 +480,20 @@ impl StageSession<'_> {
             _ = tokio::time::sleep_until(self.deadline) => { control.interrupt(); let _ = done_future.await; Err(anyhow::anyhow!("session exceeded {} seconds", self.config.session_timeout.as_secs())) },
             result = &mut done_future => Ok(result),
         };
+        if observation_lagged {
+            let recovered = self
+                .reconcile_observation(
+                    transcript,
+                    tool_log,
+                    response_log,
+                    tool_offset,
+                    response_offset,
+                )
+                .await;
+            if outcome.is_ok() {
+                outcome = recovered;
+            }
+        }
         let runtime_error = done
             .as_ref()
             .ok()
@@ -425,21 +503,6 @@ impl StageSession<'_> {
             let text = outcome?;
             let done = done?;
             match done {
-                Err(RuntimeError::OutputLimit { tool_call_count: 0 })
-                    if self
-                        .runs
-                        .last()
-                        .and_then(|attempt| attempt.responses.last())
-                        .is_some_and(|response| {
-                            response.observed_turn == self.observed_turns
-                                && response.completion.finish_reason
-                                    == Some(crabber::core::ModelFinishReason::Length)
-                                && response.completion.tool_call_count == 0
-                                && response.completion.stream_completed
-                        }) =>
-                {
-                    Ok(AttemptOutcome::Continue(ContinuationCause::OutputLimit))
-                }
                 Err(RuntimeError::TurnLimit) => Err(self.turn_limit()),
                 Err(error) => Err(error.into()),
                 Ok(result) => {
@@ -489,24 +552,70 @@ impl StageSession<'_> {
     }
 }
 
-pub(crate) fn path_deny_policy() -> Result<PathDenyPolicy> {
-    Ok(PathDenyPolicy::new(
-        [
-            ".git",
-            ".git/**",
-            "**/.git/**",
-            ".env",
-            ".env.*",
-            "**/.env",
-            "**/.env.*",
-            "*.pem",
-            "**/*.pem",
-            ".netrc",
-            "**/id_rsa",
-            "**/id_ed25519",
-        ]
-        .map(str::to_owned),
-    )?)
+async fn committed_answer(
+    store: &crabber::session::MemoryStore,
+    session: &crabber::SessionId,
+    run: &crabber::core::RunId,
+) -> Result<String> {
+    use crabber::session::Store;
+    Ok(store
+        .list_messages(session, None)
+        .await?
+        .into_iter()
+        .rev()
+        .find(|message| {
+            message.run_id.as_ref() == Some(run) && message.role == crabber::core::Role::Assistant
+        })
+        .map(|message| {
+            message
+                .parts
+                .into_iter()
+                .filter_map(|part| match part.content {
+                    crabber::core::ContentBlock::Text { text } => Some(text),
+                    _ => None,
+                })
+                .collect::<String>()
+        })
+        .unwrap_or_default())
+}
+
+pub(crate) fn path_deny_policy(config: &RunConfig) -> Result<PathDenyPolicy> {
+    let mut patterns = vec![
+        ".codex",
+        ".codex/**",
+        "**/.codex/**",
+        ".git",
+        ".git/**",
+        "**/.git/**",
+        ".env",
+        ".env.*",
+        "**/.env",
+        "**/.env.*",
+        "*.pem",
+        "**/*.pem",
+        ".netrc",
+        "**/id_rsa",
+        "**/id_ed25519",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    let auth = config
+        .codex_auth_file
+        .canonicalize()
+        .or_else(|_| std::path::absolute(&config.codex_auth_file))?;
+    if let Ok(relative) = auth.strip_prefix(&config.repo) {
+        let relative = relative
+            .to_str()
+            .context("Codex login path inside repository must be UTF-8")?;
+        patterns.push(
+            relative
+                .chars()
+                .map(|c| if "*?[]!{}\\".contains(c) { '?' } else { c })
+                .collect(),
+        );
+    }
+    Ok(PathDenyPolicy::new(patterns)?)
 }
 
 fn build_agent(
@@ -514,22 +623,18 @@ fn build_agent(
     name: &str,
     mode: SessionMode,
     max_turns: usize,
-    max_output_tokens: u32,
     store: Arc<crabber::session::MemoryStore>,
 ) -> Result<Agent> {
-    let resolver = HttpResolver::new().with_adapter(
-        HttpAdapter::opencode_go(Protocol::ChatCompletions).with_base_url(&config.base_url),
-    );
+    let resolver = crate::codex_provider::CodexProvider::new(config);
     build_agent_with_resolver(
         config,
         name,
         mode,
         max_turns,
-        max_output_tokens,
         store,
         (
             Selection {
-                provider_id: "opencode-go".into(),
+                provider_id: "codex".into(),
                 model_id: config.model.clone(),
             },
             Arc::new(resolver),
@@ -542,11 +647,10 @@ fn build_agent_with_resolver(
     name: &str,
     mode: SessionMode,
     max_turns: usize,
-    max_output_tokens: u32,
     store: Arc<crabber::session::MemoryStore>,
     provider: (Selection, Arc<dyn crabber::providers::Resolver>),
 ) -> Result<Agent> {
-    let readonly = matches!(&mode, SessionMode::Review(_));
+    let readonly = matches!(&mode, SessionMode::Review(..));
     let mut enabled = vec![
         ToolId::FileRead,
         ToolId::FileList,
@@ -567,7 +671,7 @@ fn build_agent_with_resolver(
     let tools = StandardTools::new(
         WorkspaceRoot::open(&config.repo)?,
         Policies {
-            deny: path_deny_policy()?,
+            deny: path_deny_policy(config)?,
             enabled: EnabledSet::only(enabled),
             restrict_to_enabled: !readonly,
             shell: ShellPolicy {
@@ -591,7 +695,8 @@ fn build_agent_with_resolver(
     agent_config.directory = config.repo.to_string_lossy().into_owned();
     agent_config.workspace_id = config.run_id.clone();
     agent_config.title = name.into();
-    agent_config.max_output_tokens = Some(max_output_tokens);
+    agent_config.max_output_tokens = None;
+    agent_config.model_controls.reasoning_effort = Some(config.reasoning_effort);
     agent_config.system_prompt = Some(format!(
         "You are a coding agent working in {}. Follow applicable AGENTS.md instructions. Complete the assigned task using the available tools. Never push, deploy, contact others, change branches, commit, or modify Git metadata. The host owns commits. Do not read credentials. Shell commands run locally with the user's access and are not sandboxed. Report uncertainty and failures honestly. Stop rather than claiming success when blocked.",
         config.repo.display()
@@ -602,14 +707,14 @@ fn build_agent_with_resolver(
         .map(|definition| definition.info.name.clone())
         .collect();
     let mut builder = Agent::builder()
-        .behavior_version("crabber-implement.v1")
+        .behavior_version("crabber-implement.codex.v3")
         .max_turns(max_turns)
         .store(store)
         .provider(provider.1)
         .config(agent_config)
         .policy(Arc::new(StaticPolicy::new(PermissionDecision::Allow)))
         .shared_extension(Arc::new(tools), Scope::Global);
-    if let SessionMode::Review(snapshot) = mode {
+    if let SessionMode::Review(snapshot, _) = mode {
         builder = builder.shared_extension(
             Arc::new(crate::review_artifacts::ReviewArtifacts {
                 snapshot,
@@ -630,17 +735,171 @@ pub(crate) fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::next_output_limit;
-
     #[test]
-    fn output_limit_grows_clamps_and_never_overflows() {
-        assert_eq!(next_output_limit(16384, 65536), Some(32768));
-        assert_eq!(next_output_limit(32768, 65536), Some(65536));
-        assert_eq!(next_output_limit(40000, 50000), Some(50000));
-        assert_eq!(next_output_limit(65536, 65536), None);
-        assert_eq!(next_output_limit(u32::MAX - 1, u32::MAX), Some(u32::MAX));
-        assert_eq!(next_output_limit(u32::MAX, u32::MAX), None);
+    fn credential_paths_are_denied_for_tools_and_snapshots() {
+        let (_temp, mut config) = crate::review_checkpoint::tests::fixture();
+        config.codex_auth_file = config.repo.join("tokens[private].json");
+        std::fs::write(&config.codex_auth_file, "synthetic").unwrap();
+        let deny = super::path_deny_policy(&config).unwrap();
+        for path in [
+            "tokens[private].json",
+            ".codex/auth.json",
+            "nested/.codex/auth.json",
+        ] {
+            assert!(
+                deny.matches(std::path::Path::new(path)),
+                "credential path visible: {path}"
+            );
+        }
+        assert!(!deny.matches(std::path::Path::new("src/main.rs")));
     }
+
+    #[tokio::test]
+    async fn lagged_live_observation_has_committed_answer_and_durable_completion() {
+        use crabber::session::Store;
+        let store = std::sync::Arc::new(crabber::session::MemoryStore::new());
+        let mut deltas = (0..600)
+            .map(|_| crabber::StreamDelta::TextDelta("x".into()))
+            .collect::<Vec<_>>();
+        deltas.push(crabber::StreamDelta::Completed);
+        let agent = crabber::Agent::builder()
+            .behavior_version("lag-regression.v1")
+            .store(store.clone())
+            .provider(std::sync::Arc::new(crabber::FakeProvider::scripted(vec![
+                deltas,
+            ])))
+            .config(crabber::AgentConfig::new(crabber::Selection {
+                provider_id: "fake".into(),
+                model_id: "fixture".into(),
+            }))
+            .build()
+            .unwrap();
+        let mut run = agent.prompt(None, "emit final text").await.unwrap();
+        let session = run.session_id().clone();
+        let run_id = run.run_id().clone();
+        let mut events = run.events();
+        run.done().await.unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+        ));
+        assert_eq!(
+            super::committed_answer(&store, &session, &run_id)
+                .await
+                .unwrap(),
+            "x".repeat(600)
+        );
+        let durable = store.list_events(&session, None, 256).await.unwrap();
+        assert_eq!(
+            durable
+                .iter()
+                .filter(|event| event.kind == crabber::EventKind::TurnStarted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            durable
+                .iter()
+                .filter(|event| event.kind == crabber::EventKind::ModelResponseCompleted)
+                .count(),
+            1
+        );
+        use std::io::{Seek, Write};
+        let (_temp, config) = crate::review_checkpoint::tests::fixture();
+        let mut artifacts =
+            crate::session_artifacts::SessionArtifacts::reserve(&config.artifacts, "lagged")
+                .unwrap();
+        artifacts.tools.write_all(b"prior tool\n").unwrap();
+        artifacts.responses.write_all(b"prior response\n").unwrap();
+        let tool_offset = artifacts.tools.stream_position().unwrap();
+        let response_offset = artifacts.responses.stream_position().unwrap();
+        artifacts
+            .tools
+            .write_all(b"partial current tool\n")
+            .unwrap();
+        let attempt = |id, observed| super::AttemptEvidence {
+            run_id: id,
+            observed_turns: observed,
+            continuation_cause: None,
+            responses: vec![],
+            response_count: 0,
+            responses_truncated: false,
+            status: "running",
+            error: None,
+        };
+        let mut stage = super::StageSession {
+            parent_delegation: None,
+            name: "lagged",
+            execution_generation: 1,
+            review_round: None,
+            review_role: None,
+            review_attempt: None,
+            workflow_run_id: &config.run_id,
+            session_id: Some(session),
+            run_id: Some(run_id.clone()),
+            max_turns: 256,
+            observed_turns: 7,
+            continuation_count: 1,
+            runs: vec![attempt(crabber::core::RunId::new(), 7), attempt(run_id, 0)],
+            status: "running",
+            error: None,
+            store,
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            config: &config,
+            metadata: artifacts.metadata,
+        };
+        let mut text = String::new();
+        for event in &durable {
+            stage
+                .observe_event(
+                    event,
+                    &mut text,
+                    &mut artifacts.transcript,
+                    &mut artifacts.tools,
+                    &mut artifacts.responses,
+                )
+                .unwrap();
+        }
+        assert_eq!(stage.observed_turns, 8);
+        for _ in 0..2 {
+            assert_eq!(
+                stage
+                    .reconcile_observation(
+                        &mut artifacts.transcript,
+                        &mut artifacts.tools,
+                        &mut artifacts.responses,
+                        tool_offset,
+                        response_offset
+                    )
+                    .await
+                    .unwrap(),
+                "x".repeat(600)
+            );
+            assert_eq!(stage.observed_turns, 8);
+            assert_eq!(stage.runs[0].observed_turns, 7);
+            assert_eq!(stage.runs[1].observed_turns, 1);
+            assert_eq!(stage.runs[1].response_count, 1);
+            assert_eq!(
+                std::fs::read_to_string(config.artifacts.join("lagged.responses.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2
+            );
+            assert_eq!(
+                std::fs::read_to_string(config.artifacts.join("lagged.tools.txt")).unwrap(),
+                "prior tool\n"
+            );
+        }
+        assert!(
+            agent
+                .close(std::time::Duration::from_secs(1))
+                .await
+                .local_drained()
+        );
+        agent.close_extensions().await.unwrap();
+    }
+
     #[tokio::test]
     async fn artifact_collision_never_replaces_session_metadata() {
         for suffix in ["session.json", "txt", "tools.txt", "responses.jsonl"] {
@@ -664,6 +923,14 @@ mod tests {
 
 #[cfg(test)]
 mod review_admission_tests {
+    fn test_parent() -> super::ParentDelegation {
+        super::ParentDelegation {
+            session_id: crabber::SessionId::new(),
+            run_id: crabber::core::RunId::new(),
+            call_id: crabber::core::ToolCallId::new(),
+        }
+    }
+
     use super::*;
     #[tokio::test]
     async fn configured_review_tools_admit_worst_case_final_prompt() {
@@ -677,9 +944,8 @@ mod review_admission_tests {
             let agent = build_agent_with_resolver(
                 &config,
                 "review-1-correctness-attempt-1",
-                SessionMode::Review(snapshot),
+                SessionMode::Review(snapshot, test_parent()),
                 2,
-                16384,
                 Arc::new(crabber::session::MemoryStore::new()),
                 (
                     Selection {
@@ -741,9 +1007,8 @@ mod review_admission_tests {
         let agent = build_agent_with_resolver(
             &config,
             "review",
-            SessionMode::Review(snapshot),
+            SessionMode::Review(snapshot, test_parent()),
             2,
-            16384,
             Arc::new(crabber::session::MemoryStore::new()),
             (
                 Selection {

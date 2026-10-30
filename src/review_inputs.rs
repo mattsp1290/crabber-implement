@@ -714,7 +714,7 @@ fn changed_paths(
         .collect::<Vec<_>>();
     ensure!(names.len() <= ENTRY_LIMIT, "too many changed paths");
     ensure!(!names.is_empty(), "review has no changes against base");
-    let deny = crate::agent::path_deny_policy()?;
+    let deny = crate::agent::path_deny_policy(config)?;
     for name in &names {
         ensure!(
             !deny.matches(Path::new(std::ffi::OsStr::from_bytes(name))),

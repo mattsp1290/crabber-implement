@@ -35,7 +35,7 @@ struct ReviewedRevision {
 }
 
 struct Workflow {
-    config: RunConfig,
+    config: Arc<RunConfig>,
     trace: tracing::Span,
     compiled: Compiled,
     reviewed: Mutex<Option<ReviewedRevision>>,
@@ -52,6 +52,8 @@ struct RunMetadata {
     repo: PathBuf,
     branch: String,
     model: String,
+    provider_profile: &'static str,
+    reasoning_effort: crabber::ReasoningEffort,
     heartbeat_at_ms: u128,
     execution_generation: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -150,11 +152,13 @@ pub async fn run(config: RunConfig) -> Result<()> {
     println!("branch {branch}");
     let metadata_path = config.artifacts.join("run.json");
     let mut metadata = RunMetadata {
-        version: 2,
+        version: 3,
         run_id: config.run_id.clone(),
         repo: config.repo.clone(),
         branch,
         model: config.model.clone(),
+        provider_profile: crate::config::PROVIDER_PROFILE,
+        reasoning_effort: config.reasoning_effort,
         heartbeat_at_ms: 0,
         execution_generation: config.generation,
         parent_workflow_id: config
@@ -169,7 +173,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
     let checkpoint = config.resume.clone();
     let handler = Arc::new(Workflow {
         trace: tracing::Span::current(),
-        config,
+        config: Arc::new(config),
         compiled,
         reviewed: Mutex::new(None),
         error: Mutex::new(None),
@@ -422,7 +426,7 @@ impl Workflow {
                     reviewed.round == occurrence,
                     "fix round differs from reviewed round"
                 );
-                crate::config::require_credentials()?;
+                crate::config::require_credentials(&self.config)?;
                 let name = format!("fix-review-{}", reviewed.round);
                 let artifacts = crate::session_artifacts::SessionArtifacts::reserve(
                     &self.config.artifacts,
@@ -544,7 +548,7 @@ impl Workflow {
                 .as_ref()
                 .context("missing review snapshot identity")?,
         )?;
-        let metrics = snapshot.render()?.metrics;
+
         let cached = [
             state.report(&self.config.artifacts, 0)?,
             state.report(&self.config.artifacts, 1)?,
@@ -560,47 +564,15 @@ impl Workflow {
         }
         state.persist(&self.config.artifacts)?;
         *self.checkpoint.lock().await = Some(state.clone());
-        let run_role = |i: usize| {
-            let state = &state;
-            let snapshot = &snapshot;
-            let cached = cached[i].clone();
-            let name = names[i].clone();
-            async move {
-                let span = tracing::info_span!("implement.reviewer", "workflow.run_id" = %self.config.run_id,
-                    "execution.generation" = self.config.generation, "review.round" = round, "review.role" = ROLES[i].0,
-                    "review.attempt" = state.attempts[i], "review.prompt_bytes" = tracing::field::Empty, "review.omitted_bytes" = tracing::field::Empty, outcome = if cached.is_some() { "reused" } else { "started" },
-                    "otel.status_code" = tracing::field::Empty, "error.kind" = tracing::field::Empty);
-                let reused = cached.is_some();
-                let result = async {
-                    let start = checkpoint::role_start(state.phase, true, cached.is_some())
-                        .context("reviewer cannot start in this checkpoint state")?;
-                    if !start {
-                        return cached.context("cached reviewer report missing");
-                    }
-                    let prompt = state.prompt(&self.config.artifacts, i)?;
-                    tracing::Span::current().record("review.prompt_bytes", prompt.len() as u64);
-                    tracing::Span::current()
-                        .record("review.omitted_bytes", metrics.omitted_bytes as u64);
-                    let text = agent::session(
-                        &self.config,
-                        name.as_deref().unwrap(),
-                        &prompt,
-                        agent::SessionMode::Review(snapshot.clone()),
-                        cancel,
-                    )
-                    .await?;
-                    state.publish_role(&self.config, i, &text, snapshot)
-                }
-                .instrument(span.clone())
-                .await;
-                if !reused {
-                    crate::telemetry::finish_span(&span, result.is_ok(), "review_failed");
-                }
-                result
-            }
-        };
-        let (first, second) = tokio::join!(run_role(0), run_role(1));
-        let reports = [first?, second?];
+        let reports = crate::review_dispatch::run(
+            self.config.clone(),
+            state.clone(),
+            snapshot,
+            names,
+            cached,
+            cancel,
+        )
+        .await?;
         ensure!(
             checkpoint::reports_ready([
                 state.report(&self.config.artifacts, 0)?.is_some(),

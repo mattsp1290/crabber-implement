@@ -1,13 +1,11 @@
 # Verify model completion recovery
 
-Use the actual CLI with its local chat-completions fixture. Update the sibling Crabber checkout with the finish-reason and durable completion-event changes before building.
+Use the actual CLI with its local Codex Responses fixture and synthetic native credentials.
 
 ```sh
 mkdir -p .audit/completion
 cargo test --locked --test cli completion -- --nocapture > .audit/completion/completion.txt 2>&1
 cargo test --locked --test cli continuation -- --nocapture > .audit/completion/continuation.txt 2>&1
-cargo test --locked --test cli truncated_tools -- --nocapture > .audit/completion/truncated-tools.txt 2>&1
-cargo test --locked --test cli length_without -- --nocapture > .audit/completion/length.txt 2>&1
 cargo test --locked --test cli explicit_blocker -- --nocapture > .audit/completion/blocker.txt 2>&1
 cargo test --locked --test cli failed_stream_text -- --nocapture > .audit/completion/retry.txt 2>&1
 ```
@@ -16,7 +14,7 @@ The fixture replaces the external model endpoint. It does not require a provider
 
 Require an empty reasoning-only final response to trigger a continuation in the same session and then complete real implementation and review. The incoming conversation must retain the previous task history. Require repeated empty responses to stop after the fixed allowance. Turn and time budgets apply across all continuation runs.
 
-Require a length-truncated response containing tool calls to cause zero tool execution and no host commit. A truncated response without tool calls can continue within the same allowance. Filtering and unrelated provider failures are terminal. An explicit blocker must preserve its explanation.
+Incomplete Responses and provider failures are terminal. An explicit blocker must preserve its explanation. The host does not escalate output caps.
 
 The failed-stream journey emits partial text, triggers a context-overflow retry, and verifies that the failed text cannot become the accepted final answer. The continuation prompt must remain visible after context compaction. A request-count-only fixture does not prove this history contract.
 
@@ -24,12 +22,4 @@ Session evidence retains the shared session ID, each admitted run ID, continuati
 
 The fixture removes its temporary repositories and listeners. The captured logs under `.audit/completion/` survive cleanup. A failing assertion or a filtered command that ran no tests is not a passing journey. Run the complete CLI suite before delivery.
 
-## Output-budget recovery
-
-```sh
-cargo test --locked --test cli output_budget -- --nocapture > .audit/completion/output-budget.txt 2>&1
-```
-
-Require the endpoint to withhold success until the CLI transmits a larger `max_tokens` cap. Verify the default 16384, 32768, 65536 sequence across attempts, custom ceiling clamp, equal-cap stopping, and mixed empty/length recovery. Successful file edits must survive terminal output exhaustion with unchanged HEAD and no review admission. Check rejection of invalid cap flags before repository mutation or HTTP requests. Each stage starts with its own initial cap. Truncated tools, filtering, provider rejection and compaction failures remain terminal.
-
-Attempt evidence records `requested_max_output_tokens` and `continuation_cause`. Session evidence records the initial cap and recovery ceiling. Exhausted attempts must say failed and name output exhaustion, rather than only reporting a missing answer. Keep private reasoning absent and the bounded summary below 64 KiB. Turn/deadline/cancellation checks apply to escalation too.
+The old ChatCompletions length/cap and transport-backoff cases were removed with that provider. The Codex codec reports incomplete Responses as failures and does not expose the finish cause needed to justify output escalation. These removed cases are not claimed as Codex coverage.
