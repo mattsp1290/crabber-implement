@@ -7,7 +7,7 @@ export const stageSchema = z.object({
   outcome: z.enum(["started", "implemented", "changes", "approved", "fixed"]),
 });
 export const metadataSchema = z.object({
-  version: z.union([z.literal(1), z.literal(2)]),
+  version: z.union([z.literal(1), z.literal(2), z.literal(3)]),
   execution_generation: z.number().int().positive().optional(),
   run_id: z.string(),
   repo: z.string(),
@@ -30,11 +30,17 @@ export const resultSchema = z.object({
   status: z.enum(["completed", "failed", "cancelled"]),
   error: z.string().nullable().optional(),
 });
+const parentDelegationSchema = z.object({
+  session_id: z.string().min(1).max(128),
+  run_id: z.string().min(1).max(128),
+  call_id: z.string().min(1).max(128),
+});
 export const sessionSchema = z.object({
   execution_generation: z.number().int().positive().optional(),
   review_round: z.number().int().positive().nullish(),
   review_role: z.enum(["correctness", "maintainability"]).nullish(),
   review_attempt: z.number().int().positive().nullish(),
+  parent_delegation: parentDelegationSchema.optional(),
   name: z.string(),
   workflow_run_id: z.string().optional(),
   session_id: z.string().optional(),
@@ -70,6 +76,7 @@ export const snapshotSchema = summarySchema.extend({
       reviewRound: z.number().nullable(),
       reviewRole: z.enum(["correctness", "maintainability"]).nullable(),
       reviewAttempt: z.number().nullable(),
+      parentDelegation: parentDelegationSchema.nullable(),
       reused: z.boolean(),
       maxTurns: z.number().nullable(),
       text: tailSchema,
@@ -86,7 +93,7 @@ export const runListSchema = z.object({
 });
 
 export const recoverySchema = z.object({
-  version: z.union([z.literal(1), z.literal(2)]), workflow_id: z.string(), round: z.number().int().min(1).max(100),
+  version: z.union([z.literal(1), z.literal(2), z.literal(3)]), workflow_id: z.string(), round: z.number().int().min(1).max(100),
   generation: z.number().int().positive(),
   phase: z.enum(["review_pending", "review_reports_ready", "fix_intent_recorded", "fix_committed", "completed"]),
   attempts: z.tuple([z.number().int().min(0).max(4294967295),z.number().int().min(0).max(4294967295)]),

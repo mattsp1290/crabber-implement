@@ -296,3 +296,23 @@ test("invalid or incomplete refresh lineage is never projected", async (t) => {
     assert.ok(run.warnings.some((warning) => warning.includes("run.json")));
   }
 });
+
+test("native v3 review metadata preserves parent delegation and current attempts", async (t) => {
+  const { put, reader } = await fixture(t);
+  await put("run.json", { ...metadata, version: 3, execution_generation: 2 });
+  await put("result.json", { status: "failed", execution_generation: 1 });
+  await put("review-state.json", { version: 3, workflow_id: ID, generation: 2, round: 1, phase: "review_pending", attempts: [1, 2], reused: [true, false] });
+  await put("stages.jsonl", JSON.stringify(event("review", 1, "started")) + "\n");
+  const parent = { session_id: "parent-session", run_id: "parent-run", call_id: "parent-call" };
+  for (const [role, attempt] of [["correctness", 1], ["maintainability", 2]]) {
+    const name = `review-1-${role}-attempt-${attempt}`;
+    await put(`${name}.session.json`, { name, execution_generation: 2, review_round: 1, review_role: role, review_attempt: attempt, parent_delegation: parent, status: "running" });
+  }
+  const run = await reader.snapshot(ID);
+  assert.equal(run.status, "running");
+  assert.equal(run.error, null);
+  assert.equal(run.sessions.length, 2);
+  for (const session of run.sessions) assert.deepEqual(session.parentDelegation, parent);
+  assert.equal(run.sessions.find((session) => session.reviewRole === "correctness").reused, true);
+  assert.equal(run.sessions.find((session) => session.reviewRole === "maintainability").reviewAttempt, 2);
+});

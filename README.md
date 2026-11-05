@@ -21,8 +21,9 @@ Build the binary:
 cargo build --release
 ```
 
-Export `OPENCODE_GO_API_KEY` in your shell. The program reads the environment and does not source shell profiles.
-The default provider is OpenCode Go, using `glm-5.2` and its chat-completions API.
+Sign in with `codex login`. The host reads the existing Codex ChatGPT subscription login from `$CODEX_HOME/auth.json`, or `~/.codex/auth.json` when `CODEX_HOME` is unset. `--codex-auth-file` selects another native login file. The file is read only; the host never copies its refresh token, refreshes the login, or writes to it. An expired access token requires signing in again through Codex.
+
+All model work uses the Codex CLI subscription profile and Responses API. Defaults are `gpt-5.6-terra` with `medium` reasoning effort. There is no API-key provider or fallback.
 
 Run from the repository you want to change:
 
@@ -52,12 +53,11 @@ Implementation and fixes become local commits. The program does not push them.
 crabber-implement /path/to/plan \
   --repo /path/to/repository \
   --base main \
-  --model glm-5.2 \
+  --model gpt-5.6-terra \
+  --reasoning-effort medium \
   --max-reviews 4 \
   --max-turns 256 \
   --session-timeout 1800 \
-  --max-output-tokens 16384 \
-  --max-recovery-output-tokens 65536 \
   --skills-dir "$HOME/git/dotfiles/.agents/skills"
 ```
 
@@ -67,30 +67,22 @@ The program reads the review skill for every invocation. Fix sessions use the re
 
 Autonomous fixes can change configuration, authentication, authorization, permissions, and secrets-handling source code within the plan and tool permissions. Such files do not automatically require manual attention. Genuine missing decisions, permissions, or verification blockers still stop the workflow. Fix agents cannot access live secrets, push, merge, or deploy. The host commits fixes on the working branch and requires both independent reviewers to approve the new revision before completion.
 
-`--base-url` sets an OpenAI-compatible API root without `/chat/completions`.
-Its default is `https://opencode.ai/zen/go/v1`.
-`CRABBER_IMPLEMENT_BASE_URL` and `CRABBER_IMPLEMENT_MODEL` provide environment defaults.
+`--base-url` sets the Codex Responses API root without `/responses`.
+Its default is `https://chatgpt.com/backend-api/codex`. Only use a trusted endpoint, because it receives the access token.
+
+`CRABBER_IMPLEMENT_CODEX_BASE_URL` and `CRABBER_IMPLEMENT_MODEL` provide environment defaults. The former provider endpoint variable is ignored.
 
 `--max-turns` sets a positive model-turn budget for each agent session. Its default is 256.
 `CRABBER_IMPLEMENT_MAX_TURNS` provides the environment default. The flag takes precedence.
 A model turn includes one model response and its tool batch. The final answer also consumes a turn.
 Provider retries and compaction do not add outer turns.
-The turn budget and `--session-timeout` apply independently.
+The turn budget and `--session-timeout` apply independently. Session timeouts must be between 1 and 3600 seconds, matching the native inline-delegation deadline limit.
 Both limits cover the entire stage session, including any continuations after an empty model answer.
 Reaching either limit stops the workflow and preserves partial edits. The program does not restart the workflow automatically.
 
-`--max-output-tokens` sets the initial per-response output cap, defaulting to 16,384.
-`--max-recovery-output-tokens` sets its recovery ceiling, defaulting to 65,536.
-Both must be positive integers, and the ceiling must be at least the initial cap.
-For a length-truncated response without tool calls, each eligible continuation doubles the requested cap up to the ceiling. The default sequence is 16,384, 32,768, then 65,536.
-Setting both flags to the same value disables cap escalation and stops on length truncation.
-Each implementation, review, and fix-review session starts at the initial cap.
+If a completed model response has no visible final text, the host can ask it to continue in the same conversation up to two times. Each continuation gets only the remaining turn allowance and shares the original deadline. Incomplete Responses, filtering, provider failures, cancellation, and exhausted budgets stop the stage. An explicit `BLOCKED` report retains the agent's explanation in the error. The host does not configure per-response output caps or escalate them after failure.
 
-These output caps are independent of the stage's total turn and time budgets. The ceiling is not a total-session token or cost budget. Larger caps can increase cost and latency. Providers may reject or clamp them, and no cap guarantees task completion.
-
-If a model ends without visible final text, the host can ask it to continue in the same conversation up to two times. Empty successful responses retain the current cap. Empty and truncated responses share the same two-continuation allowance, so mixed outcomes can exhaust recovery before reaching the ceiling. Each continuation gets only the remaining turn allowance and shares the original deadline. It continues from the current repository state and successful conversation history. It does not resume an interrupted private reasoning trace.
-
-The provider finish reason distinguishes a normal response from output truncation or filtering. Truncated tool calls are rejected before execution. A truncated response without tool calls can use the same bounded continuation allowance only when a larger cap is available. Output exhaustion reports the requested cap, ceiling, continuation count, and observed turn budget. It does not mean the provider honored the requested cap. Filtered responses, other provider failures, cancellation, and exhausted budgets stop the stage. An explicit `BLOCKED` report retains the agent's explanation in the error.
+The selected reasoning effort applies to ordinary turns and SDK context-compaction calls. Completed response evidence records usage and finish metadata without private reasoning. If the bounded live-event channel lags, the host joins the owned run and reads its stored events and committed final answer before deciding its outcome.
 
 The review budget includes the first review. Exhausting it returns a nonzero exit code and preserves findings.
 `NEEDS_DISCUSSION`, malformed reports, agent failures, and fixes marked `needs-manual` also stop the run.
@@ -165,14 +157,13 @@ New runs save each validated reviewer report as soon as that reviewer finishes. 
 ```sh
 ~/git/crabber-implement/target/debug/crabber-implement \
   ".agents/plans/fiber-watermill-chat/" \
-  --session-timeout 9999 --max-turns 3000 \
-  --max-output-tokens 65536 --max-recovery-output-tokens 131072 \
+  --session-timeout 3600 --max-turns 3000 \
   --resume-review <workflow-id>
 ```
 
 Use the UUID printed in the artifact path. Keep the original plan, model, endpoint and budget options. Keep the same executable: rebuilding changes its fingerprint and makes the old checkpoint ineligible. HEAD, branch, base, plan and review skill must still match, and the worktree must be clean. A changed input causes refusal before provider calls.
 
-Resume starts fresh read-only sessions for unfinished reviewers and reuses validated reports. It preserves earlier transcripts and terminal results under `executions/<generation>/`, then follows the ordinary fix and fresh-review flow. Global review limits still apply. Cached approvals can complete without provider credentials; pending reviewers and fixes require `OPENCODE_GO_API_KEY`.
+Resume starts fresh read-only sessions for unfinished reviewers and reuses validated reports. It preserves earlier transcripts and terminal results under `executions/<generation>/`, then follows the ordinary fix and fresh-review flow. Global review limits still apply. Cached approvals can complete without provider credentials; pending reviewers and fixes require a valid native Codex login.
 
 Resume is refused after fix intent has been recorded, because the host cannot safely replay an interrupted mutation. Implementation and fix sessions cannot be resumed. Runs created before review checkpoint support remain viewable but cannot be resumed.
 
@@ -180,7 +171,7 @@ The monitor shows each reviewer's round, attempt and reused status. Resumed laun
 
 ## Start a fresh review after upgrading
 
-Use `--refresh-review <workflow-id>` when the saved review used another executable or review-input protocol. Supply the original plan, repository, base, model, endpoint, turn limit, output caps, and maximum review count.
+Use `--refresh-review <workflow-id>` when the saved review used another executable. Supply the original plan, repository, base, model, reasoning effort, endpoint, turn limit, and maximum review count.
 
 ```sh
 crabber-implement /path/to/original-plan \
@@ -189,7 +180,7 @@ crabber-implement /path/to/original-plan \
   --refresh-review <source-workflow-id>
 ```
 
-Refresh accepts supported version 1 and version 2 checkpoints at an incomplete review boundary. It rejects fix intent, committed-fix boundaries, completed workflows, unsupported versions, and legacy transcripts without checkpoints. The source worktree must be clean, its HEAD unchanged, and its original implementation anchor valid. `--refresh-review` and `--resume-review` are mutually exclusive. The wall-clock session timeout remains an execution control outside saved input identity.
+Resume and refresh accept only version 3 Codex native-subagent checkpoints at an incomplete review boundary. Old OpenCode/version 1/version 2 records are rejected; start a new run. It rejects fix intent, committed-fix boundaries, completed workflows, unsupported versions, and legacy transcripts without checkpoints. The source worktree must be clean, its HEAD unchanged, and its original implementation anchor valid. `--refresh-review` and `--resume-review` are mutually exclusive. The wall-clock session timeout remains an execution control outside saved input identity.
 
 Refresh creates a new workflow UUID with generation 1 and starts both reviewers in fresh read-only sessions. Credentials are required even when the source has paired reports. The source reports become evidence, never approval for the child. The child retains the original implementation commit and copies inherited evidence into its own immutable storage. Later reviews and another refresh use that local inventory without reading ancestor workflow directories.
 
@@ -221,10 +212,12 @@ The injected acquire and release nodes do not create a sandbox. The release node
 
 Implement and fix-review agents have repository file tools and a local shell.
 They run with your user's access. Shell access is not a security sandbox.
-The shell uses a minimal environment without the provider key.
+The shell uses a minimal environment without provider credentials.
 Review agents have file reading, listing, globbing, search, and bounded immutable-artifact tools.
 The host supplies a checked snapshot of the diff, changed files, commit history, plan, and implementation evidence. The artifact capability works in linked worktrees whose Git directory is outside the workspace tool root.
-Each reviewer receives a separate Crabber session. The host writes their structured results to the skill's report format.
+A deterministic local parent Agent emits exactly one `delegate_task` call for each missing role. Its session-scoped native extension owns both review lifecycles with a concurrency limit of two. The parent makes no external model request and exposes only inline delegation. Each call carries a small immutable reservation; the trusted runner loads the bounded prompt and starts an independent read-only Codex child session. Review children cannot delegate again.
+
+The runner validates and durably publishes its report before returning a small receipt. Parent session, run, and tool-call IDs are recorded in each child's `parent_delegation` metadata. The monitor shows the selected child's subagent identity. A failed role does not erase its completed sibling. Cancellation interrupts the parent and children, and the host waits for cleanup before returning. The host writes their structured results to the skill's report format.
 Reviewers assess the supplied verification evidence. They cannot independently run shell checks.
 
 One process holds an advisory repository lock. The engine runs one work node at a time.
@@ -249,10 +242,10 @@ npm --prefix web run build
 python3 scripts/verify_web.py
 ```
 
-The Docker journey needs Docker, Node, Cargo, and the sibling Rust checkouts. It uses a local model protocol fixture and no provider key. Playwright checks artifact updates and the real CLI while an implementation session is paused, then verifies completion. Screenshots, browser traces, CLI output, and exported artifacts survive container and fixture cleanup under `.audit/web/`. The browser image is pinned to the installed Playwright version.
+The Docker journey needs Docker, Node, Cargo, and the sibling Rust checkouts. It uses a local model protocol fixture and synthetic native credentials. Playwright checks artifact updates and the real CLI while an implementation session is paused, then verifies completion. Screenshots, browser traces, CLI output, and exported artifacts survive container and fixture cleanup under `.audit/web/`. The browser image is pinned to the installed Playwright version.
 
-`tests/cli.rs` drives the actual binary against a local chat-completions fixture.
-It checks file mutation, local commits, the review-fix-review cycle, malformed review rejection, input failures, model-turn limits beyond 64 requests, and bounded recovery from empty or truncated answers.
+`tests/cli.rs` drives the actual binary against a local Codex Responses fixture.
+It checks file mutation, local commits, the review-fix-review cycle, malformed review rejection, input failures, model-turn limits beyond 64 requests, and bounded continuation after empty completed answers.
 The fixture replaces the external model boundary. It uses the real Crabber tools and DMT engine.
 
 The project-local verification skills document the live model journey and the bounded workflow check.

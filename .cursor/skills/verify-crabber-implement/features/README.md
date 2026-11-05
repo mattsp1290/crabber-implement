@@ -5,9 +5,9 @@
 - [Failure handling](failures.md) covers invalid reports, exhausted review budgets, invalid inputs, bounded transport retries, and cancellation during backoff.
 - [Model turn budget](turn-budget.md) covers long implementations, explicit caps, and session evidence.
 - [Live React monitor](monitor.md) covers current nodes, agent output, review loops, archived runs, stale heartbeats, errors, and Docker browser verification.
-- [Model completion recovery](completion.md) covers empty final answers, shared budgets, truncation, and safe failure diagnostics.
+- [Model completion recovery](completion.md) covers empty final answers, shared budgets, and safe failure diagnostics.
 
-Output-token caps, bounded truncation escalation, and edit-preserving exhaustion are covered by [completion.md](completion.md).
+[Codex subagents](codex-subagents.md) covers the subscription route, native delegation, parent linkage, and legacy checkpoint rejection.
 
 - [Datadog telemetry](telemetry.md) covers OTLP traces, correlation, redaction, exporter failures, and local-agent delivery.
 

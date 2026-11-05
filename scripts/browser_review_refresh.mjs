@@ -41,7 +41,13 @@ try {
   assert.equal(running.parentWorkflowId, parent);
   assert.equal(running.recoveryMode, 'refresh');
   assert.equal(running.reviewRound, 4);
-  assert.equal(running.sessions.filter(s => s.reviewRound === 4 && s.status === 'running' && !s.reused).length, 2);
+  const reviewers = running.sessions.filter(s => s.reviewRole && s.reviewRound === 4 && s.status === 'running' && !s.reused);
+  assert.equal(reviewers.length, 2);
+  assert.ok(reviewers[0].parentDelegation.session_id);
+  assert.equal(reviewers[0].parentDelegation.run_id, reviewers[1].parentDelegation.run_id);
+  assert.notEqual(reviewers[0].parentDelegation.call_id, reviewers[1].parentDelegation.call_id);
+  await page.getByRole('button', { name: /Correctness.*round 4.*attempt 1/ }).click();
+  await expect(page.getByText('Crabber subagent', { exact: true })).toBeVisible();
   await page.screenshot({ path: `${evidence}/refresh-child-running.png`, fullPage: true });
   await writeFile(`${evidence}/refresh-release`, 'both fresh reviewers observed\n');
   await expect(page.getByTestId('run-status')).toHaveAttribute('data-status', 'completed', { timeout: 60_000 });

@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const ROLES: [(&str, &str, &str); 2] = [
     (
         "correctness",
@@ -115,10 +115,11 @@ pub struct ReviewInputs {
     pub plan: String,
     pub skill: String,
     pub model: String,
+    pub provider_profile: String,
+    pub protocol: String,
+    pub reasoning_effort: String,
     pub endpoint: String,
     pub turns: usize,
-    pub output: u32,
-    pub recovery: u32,
     pub budget: u32,
     pub executable: String,
     pub prompts: [String; 2],
@@ -147,10 +148,11 @@ impl ReviewInputs {
             plan: durable::digest(config.plan.text.as_bytes()),
             skill: durable::digest(config.review_skill.as_bytes()),
             model: config.model.clone(),
+            provider_profile: crate::config::PROVIDER_PROFILE.into(),
+            protocol: "responses".into(),
+            reasoning_effort: config.reasoning_effort.as_str().into(),
             endpoint: durable::digest(config.base_url.as_bytes()),
             turns: config.max_turns.get(),
-            output: config.output_budget.initial.get(),
-            recovery: config.output_budget.ceiling.get(),
             budget: config.max_reviews,
             executable: config.executable_digest.clone(),
             prompts,
@@ -263,18 +265,15 @@ impl ReviewCheckpoint {
     }
 
     pub fn load(root: &Path) -> Result<Self> {
-        Self::load_versioned(root, false)
-    }
-
-    fn load_versioned(root: &Path, importing: bool) -> Result<Self> {
         durable::directory_existing(root)?;
-        let state: Self =
-            durable::json(&root.join("review-state.json"), durable::METADATA_LIMIT)
-                .context("no compatible review checkpoint; legacy transcripts cannot be resumed")?;
+        let wire: serde_json::Value =
+            durable::json(&root.join("review-state.json"), durable::METADATA_LIMIT)?;
         ensure!(
-            state.version == VERSION || (importing && state.version == 1),
-            "unsupported review checkpoint version"
+            wire["version"] == VERSION,
+            "unsupported review checkpoint version; only Codex native-subagent checkpoints can be resumed or refreshed; start a new run"
         );
+        let state: Self =
+            serde_json::from_value(wire).context("invalid Codex review checkpoint")?;
         ensure!(
             uuid::Uuid::parse_str(&state.workflow_id)?.to_string()
                 == root
@@ -292,7 +291,15 @@ impl ReviewCheckpoint {
             "only an incomplete review can resume; implementation, fix intent and completed workflows cannot be replayed"
         );
         ensure!(
-            (state.version == 2) == state.inputs.snapshot.is_some(),
+            state.inputs.snapshot.is_some()
+                && state.inputs.provider_profile == crate::config::PROVIDER_PROFILE
+                && state.inputs.protocol == "responses"
+                && !state.inputs.model.trim().is_empty()
+                && state
+                    .inputs
+                    .reasoning_effort
+                    .parse::<crabber::ReasoningEffort>()
+                    .is_ok(),
             "checkpoint snapshot protocol mismatch"
         );
         if let Some(identity) = &state.inputs.snapshot {
@@ -356,20 +363,14 @@ impl ReviewCheckpoint {
             &self
                 .directory(root)
                 .join(format!("{}.prompt.txt", ROLES[role].0)),
-            if self.version == 1 {
-                durable::PROMPT_LIMIT
-            } else {
-                crate::review_inputs::PROMPT_LIMIT
-            },
+            crate::review_inputs::PROMPT_LIMIT,
         )?;
         ensure!(
             durable::digest(&bytes) == self.inputs.prompts[role],
             "review prompt digest mismatch"
         );
         let prompt = String::from_utf8(bytes)?;
-        if self.version == VERSION {
-            crate::review_inputs::validate_prompt(&prompt)?;
-        }
+        crate::review_inputs::validate_prompt(&prompt)?;
         Ok(prompt)
     }
 
@@ -615,7 +616,7 @@ pub struct RefreshSource {
 }
 impl RefreshSource {
     pub fn load(config: &RunConfig, root: &Path) -> Result<Self> {
-        let state = ReviewCheckpoint::load_versioned(root, true)?;
+        let state = ReviewCheckpoint::load(root)?;
         crate::review_inputs::check_changed_paths(config)?;
         let mut current = ReviewInputs::current(config, state.inputs.prompts.clone())?;
         current.executable = state.inputs.executable.clone();

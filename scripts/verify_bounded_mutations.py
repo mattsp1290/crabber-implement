@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise six production defects, restore exact bytes, then rerun the formal checks."""
+"""Exercise native delegation and workflow defects, restore exact bytes, then rerun the formal checks."""
 import argparse
 import hashlib
 import json
@@ -32,6 +32,12 @@ def function_span(text, name):
 
 
 variants = [
+    ('unreserved-delegation', 'src/review_dispatch.rs', 'claim',
+     r'name == task', 'true',
+     'formal_delegation_reservations', 'delegation escaped immutable role reservation'),
+    ('legacy-protocol', 'src/review_checkpoint.rs', 'load',
+     r'wire\["version"\] == VERSION', 'true',
+     'formal_legacy_checkpoint_versions_are_rejected', 'legacy checkpoint accepted as native subagent recovery'),
     ('round-reset', 'src/review_checkpoint.rs', 'refresh_round',
      r'review_round\(source_round,\s*1,\s*budget\)', 'review_round(source_round, 1, budget).map(|_| 1)',
      'formal_refresh_readiness', 'refresh global review budget reset'),

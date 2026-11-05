@@ -18,6 +18,17 @@ try {
   const failed = await snapshot();
   assert.equal(failed.sessions.find(s => s.reviewRole === 'correctness').status, 'completed');
   assert.equal(failed.sessions.find(s => s.reviewRole === 'maintainability').status, 'failed');
+  const children = failed.sessions.filter(session => session.reviewRole);
+  assert.equal(children.length, 2);
+  for (const child of children) {
+    assert.ok(child.parentDelegation.session_id);
+    assert.ok(child.parentDelegation.run_id);
+    assert.ok(child.parentDelegation.call_id);
+  }
+  assert.equal(children[0].parentDelegation.run_id, children[1].parentDelegation.run_id);
+  assert.notEqual(children[0].parentDelegation.call_id, children[1].parentDelegation.call_id);
+  await page.getByRole('button', { name: /Correctness · round 1 · attempt 1/ }).click();
+  await expect(page.getByText('Crabber subagent', { exact: true })).toBeVisible();
   await page.screenshot({ path: `${evidence}/review-failed.png`, fullPage: true });
   await writeFile(`${evidence}/review-continue`, 'resume only the missing reviewer\n');
   await expect(page.getByTestId('run-status')).toHaveAttribute('data-status', 'running', { timeout: 30_000 });

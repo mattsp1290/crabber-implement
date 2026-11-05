@@ -61,7 +61,7 @@ fn cli_admission_proof_limit_exports_safe_metadata_before_provider_dispatch() {
         "PRIVATE_ADMISSION_INPUT_SENTINEL",
         "PRIVATE_ADMISSION_PATH_SENTINEL",
         "PRIVATE_ADMISSION_URL_SENTINEL",
-        "PRIVATE_TELEMETRY_KEY_SENTINEL",
+        "fixture-signature",
         "PRIVATE_AGENTLESS_KEY_SENTINEL",
     ] {
         assert!(!exported.contains(private), "export leaked {private}");
