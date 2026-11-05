@@ -7,7 +7,9 @@
 - [Live React monitor](monitor.md) covers current nodes, agent output, review loops, archived runs, stale heartbeats, errors, and Docker browser verification.
 - [Model completion recovery](completion.md) covers empty final answers, shared budgets, and safe failure diagnostics.
 
-[Codex subagents](codex-subagents.md) covers the subscription route, native delegation, parent linkage, and legacy checkpoint rejection.
+[Codex subagents](codex-subagents.md) covers the subscription route, native delegation, parent linkage, legacy checkpoint rejection, model-side tool batching, ordered success and error replay, and mutable-session test timeout guidance.
+
+- [Prepared tool invocation evidence](tool-invocation-evidence.md) covers pending and settled provenance, final prepared inputs, durable replay, and retained CLI artifacts.
 
 - [Datadog telemetry](telemetry.md) covers OTLP traces, correlation, redaction, exporter failures, and local-agent delivery.
 

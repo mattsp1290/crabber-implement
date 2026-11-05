@@ -20,7 +20,8 @@ impl CodexProvider {
                 HttpAdapter::codex_cli(Arc::new(crate::codex_auth::CodexAuthFileStore::new(
                     config.codex_auth_file.clone(),
                 )))
-                .with_base_url(&config.base_url),
+                .with_base_url(&config.base_url)
+                .with_responses_parallel_tool_calls(true),
             ),
             effort: config.reasoning_effort,
         }

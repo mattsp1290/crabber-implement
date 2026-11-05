@@ -63,6 +63,7 @@ pub(super) fn normalize(mut body: Value) -> Value {
     assert_eq!(body["reasoning"]["effort"], "medium");
     assert_eq!(body["store"], false);
     assert_eq!(body["stream"], true);
+    assert_eq!(body["parallel_tool_calls"], true);
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert!(body.get("messages").is_none());
     let mut messages = Vec::new();
@@ -117,9 +118,14 @@ pub(super) fn responses_sse(chunk: &Value) -> String {
             result += &event(
                 json!({"type":"response.output_item.added","output_index":index,"item":item}),
             );
+        }
+        for (index, call) in calls.iter().enumerate().rev() {
             result += &event(
                 json!({"type":"response.function_call_arguments.delta","output_index":index,"delta":call["function"]["arguments"]}),
             );
+        }
+        for (index, call) in calls.iter().enumerate().rev() {
+            let item = json!({"type":"function_call","call_id":call["id"],"name":call["function"]["name"],"arguments":call["function"]["arguments"]});
             if choice["finish_reason"] != "length" {
                 result += &event(
                     json!({"type":"response.output_item.done","output_index":index,"item":item}),
@@ -141,6 +147,58 @@ pub(super) fn responses_sse(chunk: &Value) -> String {
         }
     }
     result
+}
+
+#[test]
+fn batched_tool_calls_replay_both_results_and_preserve_errors_in_call_order() {
+    let repo = repository();
+    let fixture = Fixture::start(repo.path(), false);
+    let output = completion_run(repo.path(), &fixture, "BATCHED_TOOLS", &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("hello.txt")).unwrap(),
+        "fixed\n"
+    );
+    let history = fixture.history.lock().unwrap();
+    let replay = &history[1];
+    assert_eq!(replay["parallel_tool_calls"], true);
+    let calls: Vec<_> = replay["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "function_call")
+        .collect();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["call_id"], "batch-write");
+    assert_eq!(calls[0]["name"], "file_write");
+    assert_eq!(
+        serde_json::from_str::<Value>(calls[0]["arguments"].as_str().unwrap()).unwrap(),
+        json!({"path":"hello.txt","content":"initial\n"})
+    );
+    assert_eq!(calls[1]["call_id"], "batch-denied-read");
+    assert_eq!(calls[1]["name"], "file_read");
+    assert_eq!(
+        serde_json::from_str::<Value>(calls[1]["arguments"].as_str().unwrap()).unwrap(),
+        json!({"path":"../outside-batching"})
+    );
+    let results: Vec<_> = replay["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "function_call_output")
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["call_id"], "batch-write");
+    assert_eq!(results[1]["call_id"], "batch-denied-read");
+    let written: Value = serde_json::from_str(results[0]["output"].as_str().unwrap()).unwrap();
+    assert_eq!(written["outcome"], "succeeded");
+    assert_eq!(written["bytes_written"], 8);
+    let denied: Value = serde_json::from_str(results[1]["output"].as_str().unwrap()).unwrap();
+    assert_eq!(denied["error"]["category"], "path_escape");
 }
 
 pub(super) fn assert_native_delegations(artifacts: &Path, expected_children: usize) {
