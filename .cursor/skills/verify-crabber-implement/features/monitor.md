@@ -19,8 +19,14 @@ Evidence stays under `.audit/web/`. Require a passing `result.json`, CLI test ou
 
 The helper stops only its named monitor container, releases fixture holds, and waits for fixture cleanup even after failure. Evidence is outside disposable containers and temporary Git repositories. Confirm it survives cleanup.
 
+The refresh journey starts with a failed source at global round four. It observes a distinct child with two fresh reviewer attempts, releases their fixture responses, waits for paired approval, and follows the lineage link back to the preserved source failure. Require `refresh-browser.json`, the source/running/completed screenshots, `refresh-cli.txt`, and copied source and child artifacts under `refresh-cli/`. The synthetic browser test also checks that version 2 checkpoints retain fresh attempt labels.
+
+If the default Docker daemon has storage errors, run the helper with `DOCKER_HOST` pointing to a task-owned healthy daemon. Do not restart shared workloads. For legacy-executable import coverage, set `CRABBER_VERIFY_LEGACY_BINARY` to a preserved pre-bounded-input executable before running the helper.
+
 ```sh
 python3 -c 'import json; from pathlib import Path; p=Path(".audit/web"); assert json.loads((p/"result.json").read_text())["status"] == "passed"; assert (p/"cli/completed").is_dir()'
 ```
 
-For manual inspection, use the launch command in the repository README. `ARTIFACTS_DIR` must name the parent directory of run UUID directories. The monitor uses one-second polling, displays bounded text/tool tails, and marks missing or stale process heartbeats as unknown. The terminal `result.json` takes precedence over the heartbeat.
+For manual inspection, use the launch command in the repository README. `ARTIFACTS_DIR` must name the parent directory of run UUID directories. The monitor uses one-second polling, displays bounded text/tool tails, and marks missing or stale process heartbeats as unknown. The terminal `result.json` takes precedence only when it matches the current execution generation. A prior failure is ignored during a resumed launch. The review recovery journey also verifies reused reviewer labels and attempt numbers.
+
+The same Docker driver exercises explicit refresh through `cli_review_refresh_browser_journey`. It displays the failed source and its linked child, both fresh reviewers at global round 4 and attempt 1, then child completion while the source remains failed. Parent workflow metadata must be a UUID and recovery mode must be `refresh`; incomplete or malformed lineage is rejected. Inspect the `refresh-browser.json` result and refresh screenshots under the selected evidence directory. The driver copies source and child artifacts before deleting its disposable repository.

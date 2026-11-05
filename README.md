@@ -13,7 +13,7 @@ Keep these checkouts beside each other:
 ~/git/dmt-flows
 ```
 
-The Crabber checkout must include the public `AgentBuilder::max_turns` API and model completion metadata. Update the sibling checkout when building after a completion-handling change.
+The tested Crabber revision is `a3fdd0ee6eb4f1c05ea973302ebeefd79e829f1a`. It provides typed admission proof-limit errors, model completion metadata, and the tool-extension APIs used by bounded reviews.
 
 Build the binary:
 
@@ -38,6 +38,7 @@ You can also select a target explicitly:
 
 The plan can be one `.md` file or a directory with `00-overview.md` and numerically prefixed Markdown documents.
 Directory documents are read in filename order. A document marked `Status: Blocked` stops the run.
+Plan loading scans at most 4096 directory entries, including ignored entries, and selects at most 256 numbered Markdown files. The rendered plan, including document headers and separators, must fit 2,000,000 UTF-8 bytes. The review skill must fit 16 MiB. Bounded regular-file reads reject larger inputs and special files before credentials, provider calls, artifact creation, or branch changes.
 Commit or stash existing changes before starting, including an untracked plan inside the target repository.
 
 The program creates an `implement/<run-id>` branch when started on the base branch.
@@ -55,12 +56,16 @@ crabber-implement /path/to/plan \
   --max-reviews 4 \
   --max-turns 256 \
   --session-timeout 1800 \
+  --max-output-tokens 16384 \
+  --max-recovery-output-tokens 65536 \
   --skills-dir "$HOME/git/dotfiles/.agents/skills"
 ```
 
-`--skills-dir` must contain `review/SKILL.md` and `fix-review/SKILL.md`.
+`--skills-dir` must contain `review/SKILL.md`.
 The default is `~/git/dotfiles/.agents/skills`.
-The program reads both files for every invocation and supplies their instructions to the corresponding agents.
+The program reads the review skill for every invocation. Fix sessions use the repository-owned [autonomous fix-review skill](skills/fix-review-autonomous/SKILL.md), embedded in the binary at build time. An external `fix-review/SKILL.md` is neither required nor loaded.
+
+Autonomous fixes can change configuration, authentication, authorization, permissions, and secrets-handling source code within the plan and tool permissions. Such files do not automatically require manual attention. Genuine missing decisions, permissions, or verification blockers still stop the workflow. Fix agents cannot access live secrets, push, merge, or deploy. The host commits fixes on the working branch and requires both independent reviewers to approve the new revision before completion.
 
 `--base-url` sets an OpenAI-compatible API root without `/chat/completions`.
 Its default is `https://opencode.ai/zen/go/v1`.
@@ -74,9 +79,18 @@ The turn budget and `--session-timeout` apply independently.
 Both limits cover the entire stage session, including any continuations after an empty model answer.
 Reaching either limit stops the workflow and preserves partial edits. The program does not restart the workflow automatically.
 
-If a model ends without visible final text, the host can ask it to continue in the same conversation up to two times. Each continuation gets only the remaining turn allowance and shares the original deadline. It continues from the current repository state and conversation history.
+`--max-output-tokens` sets the initial per-response output cap, defaulting to 16,384.
+`--max-recovery-output-tokens` sets its recovery ceiling, defaulting to 65,536.
+Both must be positive integers, and the ceiling must be at least the initial cap.
+For a length-truncated response without tool calls, each eligible continuation doubles the requested cap up to the ceiling. The default sequence is 16,384, 32,768, then 65,536.
+Setting both flags to the same value disables cap escalation and stops on length truncation.
+Each implementation, review, and fix-review session starts at the initial cap.
 
-The provider finish reason distinguishes a normal response from output truncation or filtering. Truncated tool calls are rejected before execution. A truncated response without tool calls can use the same bounded continuation allowance. Filtered responses, other provider failures, cancellation, and exhausted budgets stop the stage. An explicit `BLOCKED` report retains the agent's explanation in the error.
+These output caps are independent of the stage's total turn and time budgets. The ceiling is not a total-session token or cost budget. Larger caps can increase cost and latency. Providers may reject or clamp them, and no cap guarantees task completion.
+
+If a model ends without visible final text, the host can ask it to continue in the same conversation up to two times. Empty successful responses retain the current cap. Empty and truncated responses share the same two-continuation allowance, so mixed outcomes can exhaust recovery before reaching the ceiling. Each continuation gets only the remaining turn allowance and shares the original deadline. It continues from the current repository state and successful conversation history. It does not resume an interrupted private reasoning trace.
+
+The provider finish reason distinguishes a normal response from output truncation or filtering. Truncated tool calls are rejected before execution. A truncated response without tool calls can use the same bounded continuation allowance only when a larger cap is available. Output exhaustion reports the requested cap, ceiling, continuation count, and observed turn budget. It does not mean the provider honored the requested cap. Filtered responses, other provider failures, cancellation, and exhausted budgets stop the stage. An explicit `BLOCKED` report retains the agent's explanation in the error.
 
 The review budget includes the first review. Exhausting it returns a nonzero exit code and preserves findings.
 `NEEDS_DISCUSSION`, malformed reports, agent failures, and fixes marked `needs-manual` also stop the run.
@@ -120,7 +134,21 @@ Each session also writes `<stage>.session.json` on success or failure after the 
 It records the workflow run ID, Crabber session and run IDs, configured turn budget, observed model-turn count, status, and error.
 These records contain no provider credentials.
 They also record individual continuation runs, cumulative turn counts, finish reasons, and token usage. Session JSON keeps a bounded tail of response summaries. `<stage>.responses.jsonl` retains every completed-response record. Private model reasoning is not copied into these diagnostics. A provider request ending successfully does not by itself mean that implementation completed.
-The CLI writes diagnostics locally and does not configure a Datadog exporter.
+### Datadog tracing
+
+Retryable provider failures receive at most five attempts per model turn, with waits of 1, 2, 4, and 8 seconds. The session deadline and cancellation still interrupt these waits. Failures after visible text or tool-call data are not retried. Transport errors report fixed `phase`, `cause`, and I/O categories without raw error text or URLs. These categories also appear on provider trace spans as `transport.phase`, `transport.cause`, and `transport.io_kind`. A missing I/O cause is reported as `unknown`; it does not establish a provider outage.
+
+The CLI exports metadata-only APM traces to the local Datadog agent at `http://127.0.0.1:4318/v1/traces` by default. No application ingestion key is needed; the agent forwards data using its own configuration. [Enable OTLP ingestion in the agent](https://docs.datadoghq.com/opentelemetry/setup/otlp_ingest_in_the_agent/) and keep its HTTP receiver bound to loopback for a host-local deployment. If `otlp_config.traces.enabled` is explicitly false, set it to true and restart the agent. A listening OTLP logs endpoint alone does not establish trace ingestion.
+
+The service defaults to `crabber-implement`. `DD_SERVICE` or `OTEL_SERVICE_NAME` overrides it; `DD_ENV` and `DD_VERSION` provide environment/version tags. The version defaults to the executable's package version. Standard `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` settings override the collector endpoint. The SDK supports HTTP/protobuf and HTTP/JSON. Protocol and timeout overrides apply with the default endpoint too. Standard `OTEL_TRACES_SAMPLER` settings remain effective. Export request/shutdown timeout is capped at three seconds. The local receiver does not require `OTEL_EXPORTER_OTLP_HEADERS`; do not put credentials into endpoint URLs.
+
+Each workflow has a root trace. Stage, session, continuation-attempt, model-call, and tool-call spans include their relevant identifiers, outcomes, timings, and model token counts. `workflow.run_id` tags all trace resources so background SDK lifecycle spans can be found even when they are outside the main execution tree. The workflow identifier is the artifact directory name. `telemetry.json` records the root trace ID and local exporter status on startup and shutdown. `flushed` means the SDK completed shutdown without a transport error. `delivery` remains `unverified`: sampling may suppress all spans, and the exporter does not surface collector partial-rejection counts. This state does not prove any spans were sent, accepted, indexed, or retained. Verify delivery with a Datadog query.
+
+Prompts, plan text, paths, branch names, tool arguments/results, provider response bodies, raw error messages, and private reasoning are excluded from exports. Detailed diagnostics remain in the local artifacts. This integration exports APM traces through the agent; it does not enable the SDK's separate agentless metrics, logs, or LLM Observability intake, and it does not load `DD_API_KEY`.
+
+Use `--no-telemetry`, `CRABBER_IMPLEMENT_NO_TELEMETRY=true`, or `OTEL_SDK_DISABLED=true` to disable export. Invalid telemetry configuration or collector failure prints a redacted warning and records a finite error category in `telemetry.json`. The workflow keeps its original success/failure result. Exporter shutdown is awaited on workflow success, failure, and cancellation before the process exits.
+
+Pup authentication is independent of export configuration. After ingestion, query US3 APM with `service:crabber-implement @workflow.run_id:<artifact-directory-name>`. Ordinary CLI fixture tests disable telemetry. The explicit `telemetry_local_agent_smoke` test submits a synthetic failure through the local agent without running the user's plan.
 
 Review reports live at `reviews/<run-id>-<round>/` in the target repository.
 Each round has a `review-v1` manifest and two reviewer directories with the five files required by the review skill.
@@ -129,6 +157,59 @@ Generated review directories are ignored through the repository's local Git excl
 
 A successful run exits with code zero and prints `done <commit>`.
 Inspect the commits and review reports before publishing them.
+
+## Resume an interrupted review
+
+New runs save each validated reviewer report as soon as that reviewer finishes. If review fails or the process stops before fix work begins, rerun the same command with `--resume-review <workflow-id>`:
+
+```sh
+~/git/crabber-implement/target/debug/crabber-implement \
+  ".agents/plans/fiber-watermill-chat/" \
+  --session-timeout 9999 --max-turns 3000 \
+  --max-output-tokens 65536 --max-recovery-output-tokens 131072 \
+  --resume-review <workflow-id>
+```
+
+Use the UUID printed in the artifact path. Keep the original plan, model, endpoint and budget options. Keep the same executable: rebuilding changes its fingerprint and makes the old checkpoint ineligible. HEAD, branch, base, plan and review skill must still match, and the worktree must be clean. A changed input causes refusal before provider calls.
+
+Resume starts fresh read-only sessions for unfinished reviewers and reuses validated reports. It preserves earlier transcripts and terminal results under `executions/<generation>/`, then follows the ordinary fix and fresh-review flow. Global review limits still apply. Cached approvals can complete without provider credentials; pending reviewers and fixes require `OPENCODE_GO_API_KEY`.
+
+Resume is refused after fix intent has been recorded, because the host cannot safely replay an interrupted mutation. Implementation and fix sessions cannot be resumed. Runs created before review checkpoint support remain viewable but cannot be resumed.
+
+The monitor shows each reviewer's round, attempt and reused status. Resumed launches keep the workflow ID and create a new trace with the execution generation and predecessor trace ID. Transport spans additionally expose finite `transport.protocol_code` and `transport.chain_status` categories; they never include source error messages.
+
+## Start a fresh review after upgrading
+
+Use `--refresh-review <workflow-id>` when the saved review used another executable or review-input protocol. Supply the original plan, repository, base, model, endpoint, turn limit, output caps, and maximum review count.
+
+```sh
+crabber-implement /path/to/original-plan \
+  --repo /path/to/repository \
+  --max-reviews 4 \
+  --refresh-review <source-workflow-id>
+```
+
+Refresh accepts supported version 1 and version 2 checkpoints at an incomplete review boundary. It rejects fix intent, committed-fix boundaries, completed workflows, unsupported versions, and legacy transcripts without checkpoints. The source worktree must be clean, its HEAD unchanged, and its original implementation anchor valid. `--refresh-review` and `--resume-review` are mutually exclusive. The wall-clock session timeout remains an execution control outside saved input identity.
+
+Refresh creates a new workflow UUID with generation 1 and starts both reviewers in fresh read-only sessions. Credentials are required even when the source has paired reports. The source reports become evidence, never approval for the child. The child retains the original implementation commit and copies inherited evidence into its own immutable storage. Later reviews and another refresh use that local inventory without reading ancestor workflow directories.
+
+The global review round and maximum review count do not reset. A refresh of round 4 with `--max-reviews 4` can approve or fail, but cannot run a fix or review 5. Initialization does not switch branches, create product commits, replay implementation, or rerun a fix. A failed initialization can leave an incomplete child for inspection. Repeating the command creates another UUID and preserves every source artifact. Strict resume can later continue the child under the child's own executable and snapshot identity.
+
+The monitor links the child to its parent and displays the preserved round and fresh reviewer attempts. The source failure remains a separate run. `recovery-origin.json` records private provenance. Run and telemetry metadata expose only the parent UUID and finite recovery mode.
+
+## Review input limits
+
+Each final reviewer prompt is at most 256 KiB of UTF-8 bytes, including role instructions and references. Raw excerpts share a 64 KiB allowance across the plan, review skill, diff, and execution evidence. Omitted content remains accessible through `review_artifact_catalog` and `review_artifact_read`. Reviewers must inspect relevant omitted evidence and report uncertainty when they cannot inspect it.
+
+Each snapshot contains the plan, review skill, pinned Git diff, committed changed files, commit list, and execution evidence. Binary files retain their bytes. Deleted files and committed symlinks retain their classification, and symlink targets are never opened. Non-UTF-8 Git paths use lossless hexadecimal labels. The host checks credential-denied changed paths before reading Git bodies. Original logs remain unchanged.
+
+Snapshot limits are 16 MiB per artifact, 128 MiB in total, 4096 entries, and 1 MiB for serialized manifest metadata. Overflow fails explicitly before review sessions launch. Artifact requests accept immutable IDs and bounded byte ranges, never paths. Encoded responses stay below 32 KiB and include continuation offsets. Directory handles, no-follow opens, and digest checks prevent path substitution. An integrity failure prevents report publication even if a reviewer ignores the tool error.
+
+`review-checkpoints/<round>/input-metrics.json` records final prompt bytes, snapshot bytes, excerpt bytes, and omitted bytes. Numeric prompt and omission counts also appear on reviewer spans. Model-authored summaries remain claims. Unstructured tool output is never automatically labeled a passing verification result.
+
+An SDK admission proof limit remains a typed failure with finite diagnostic metadata. The host closes the local attempt and preserves the primary error. It does not raise proof budgets, retry the failed admission automatically, or treat local task drainage as store reconciliation.
+
+Configuration size ceilings do not guarantee SDK admission for every stage. Implementation still receives the complete plan. A near-2 MB plan can exhaust its admission proof allowance before review begins. Review snapshots reference large plan and skill content through the bounded artifact reader.
 
 ## Execution model and limits
 
@@ -141,14 +222,14 @@ The injected acquire and release nodes do not create a sandbox. The release node
 Implement and fix-review agents have repository file tools and a local shell.
 They run with your user's access. Shell access is not a security sandbox.
 The shell uses a minimal environment without the provider key.
-Review agents have only file reading, listing, globbing, and search tools.
-The host supplies the diff, changed files, commit history, plan, and implementation evidence.
+Review agents have file reading, listing, globbing, search, and bounded immutable-artifact tools.
+The host supplies a checked snapshot of the diff, changed files, commit history, plan, and implementation evidence. The artifact capability works in linked worktrees whose Git directory is outside the workspace tool root.
 Each reviewer receives a separate Crabber session. The host writes their structured results to the skill's report format.
 Reviewers assess the supplied verification evidence. They cannot independently run shell checks.
 
 One process holds an advisory repository lock. The engine runs one work node at a time.
 Mutation nodes have no automatic retry and refuse lease replay.
-Workflow state uses DMT's in-memory store. Artifacts survive a crash, but automatic resume is not implemented.
+Workflow state uses DMT's in-memory store. Explicit review-only recovery reconstructs a bounded graph from durable checkpoints; other stages have no crash resume.
 A failed run can leave task edits or commits for inspection. Commit or stash remaining edits before starting a new run.
 
 ## Verify changes

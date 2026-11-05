@@ -6,6 +6,7 @@ import {
   resultSchema,
   sessionSchema,
   stageSchema,
+  recoverySchema,
 } from "./schema.js";
 
 export const TAIL_BYTES = 64 * 1024;
@@ -16,7 +17,7 @@ const MAX_ENTRIES = 5000;
 const JSON_BYTES = 64 * 1024;
 const ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SESSION =
-  /^(implement|review-\d+-(correctness|maintainability)|fix-review-\d+)$/;
+  /^(implement|review-\d+-(correctness|maintainability)(-attempt-[1-9]\d*)?|fix-review-\d+)$/;
 
 export class ReaderError extends Error {
   constructor(message, status = 500) {
@@ -97,9 +98,9 @@ async function readFile(run, name, limit, tail = false) {
   }
 }
 
-async function json(run, name, schema, warnings) {
+async function json(run, name, schema, warnings, limit = JSON_BYTES) {
   try {
-    const file = await readFile(run, name, JSON_BYTES);
+    const file = await readFile(run, name, limit);
     if (!file) return null;
     return schema.parse(JSON.parse(file.content));
   } catch (error) {
@@ -129,6 +130,7 @@ async function stagesFor(run, warnings) {
 }
 
 export function deriveState({ stages, metadata, result, now }) {
+  if (result && (result.execution_generation ?? 1) !== (metadata?.execution_generation ?? 1)) result = null;
   const last = stages.at(-1);
   const heartbeat = metadata?.heartbeat_at_ms;
   const fresh =
@@ -149,11 +151,12 @@ export function deriveState({ stages, metadata, result, now }) {
 async function readRun(root, id, full, now) {
   const run = await directory(root, id);
   const warnings = [];
-  const [metadata, result, stages] = await Promise.all([
+  const [metadata, rawResult, stages] = await Promise.all([
     json(run, "run.json", metadataSchema, warnings),
     json(run, "result.json", resultSchema, warnings),
     stagesFor(run, warnings),
   ]);
+  const result = rawResult && (rawResult.execution_generation ?? 1) === (metadata?.execution_generation ?? 1) ? rawResult : null;
   const stat = await lstat(run.location);
   const state = deriveState({ metadata, result, stages, now });
   const summary = {
@@ -166,9 +169,15 @@ async function readRun(root, id, full, now) {
     heartbeatAt: metadata?.heartbeat_at_ms ?? null,
     resultStatus: result?.status ?? null,
     error: result?.error ?? null,
+    parentWorkflowId: metadata?.parent_workflow_id ?? null,
+    recoveryMode: metadata?.recovery_mode ?? null,
+    reviewRound: metadata?.review_round ?? null,
   };
   if (!full) return summary;
-  const names = new Set();
+  const recovery = await json(run, "review-state.json", recoverySchema, warnings, 1024 * 1024);
+  const activeRecovery = recovery?.workflow_id === id && recovery.generation === metadata?.execution_generation ? recovery : null;
+  const activeNames = activeRecovery ? ["correctness","maintainability"].map((role,i) => activeRecovery.attempts[i] > 0 ? `review-${activeRecovery.round}-${role}-attempt-${activeRecovery.attempts[i]}` : null) : [];
+  const names = new Set(activeNames.filter(Boolean));
   let scanned = 0;
   for await (const entry of await opendir(run.location)) {
     const base = entry.name.replace(
@@ -193,10 +202,14 @@ async function readRun(root, id, full, now) {
       return {
         name,
         status:
-          session?.status === "running" && state.status !== "running"
+          session?.status === "running" && (state.status !== "running" || (session.execution_generation ?? 1) !== (metadata?.execution_generation ?? 1))
             ? "unknown"
             : (session?.status ?? "unknown"),
         observedTurns: session?.observed_turns ?? null,
+        reviewRound: session?.review_round ?? null,
+        reviewRole: session?.review_role ?? null,
+        reviewAttempt: session?.review_attempt ?? null,
+        reused: !!activeRecovery && activeNames.some((n,i) => n === name && activeRecovery.reused[i]),
         maxTurns: session?.max_turns ?? null,
         text: text ?? { content: "", truncated: false },
         tools: tools ?? { content: "", truncated: false },

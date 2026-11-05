@@ -23,3 +23,13 @@ The failed-stream journey emits partial text, triggers a context-overflow retry,
 Session evidence retains the shared session ID, each admitted run ID, continuation count, cumulative observed turns, finish reasons, token usage, and the final status or error. Response summaries are bounded so long sessions remain readable by the monitor. `<stage>.responses.jsonl` retains the full completed-response metadata history. These diagnostics exclude private reasoning. Earlier narration from a tool turn or failed provider attempt must never substitute for the final answer.
 
 The fixture removes its temporary repositories and listeners. The captured logs under `.audit/completion/` survive cleanup. A failing assertion or a filtered command that ran no tests is not a passing journey. Run the complete CLI suite before delivery.
+
+## Output-budget recovery
+
+```sh
+cargo test --locked --test cli output_budget -- --nocapture > .audit/completion/output-budget.txt 2>&1
+```
+
+Require the endpoint to withhold success until the CLI transmits a larger `max_tokens` cap. Verify the default 16384, 32768, 65536 sequence across attempts, custom ceiling clamp, equal-cap stopping, and mixed empty/length recovery. Successful file edits must survive terminal output exhaustion with unchanged HEAD and no review admission. Check rejection of invalid cap flags before repository mutation or HTTP requests. Each stage starts with its own initial cap. Truncated tools, filtering, provider rejection and compaction failures remain terminal.
+
+Attempt evidence records `requested_max_output_tokens` and `continuation_cause`. Session evidence records the initial cap and recovery ceiling. Exhausted attempts must say failed and name output exhaustion, rather than only reporting a missing answer. Keep private reasoning absent and the bounded summary below 64 KiB. Turn/deadline/cancellation checks apply to escalation too.

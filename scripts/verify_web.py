@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import signal
 import subprocess
 import time
 import urllib.request
@@ -111,7 +112,7 @@ try:
     with (evidence / 'cli.txt').open('w') as output:
         process = subprocess.Popen(['cargo', 'test', '--locked', '--test', 'cli',
                                     'cli_streams_live_artifacts_before_completion', '--', '--nocapture'],
-                                   cwd=ROOT, env=environment, stdout=output, stderr=subprocess.STDOUT)
+                                   cwd=ROOT, env=environment, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
         wait_until(lambda: (exported / 'snapshot.json').is_file() or process.poll() is not None,
                    'live CLI artifacts', timeout=180)
         if process.poll() is not None:
@@ -128,20 +129,83 @@ try:
         if process.wait(timeout=90):
             raise RuntimeError('CLI live journey failed. Read cli.txt.')
     (evidence / 'result.json').write_text(json.dumps({
-        'status': 'passed', 'image': image, 'browser_image': browser_image,
+        'status': 'in_progress', 'image': image, 'browser_image': browser_image,
         'live_run_id': snapshot['run_id'], 'cli_exit_code': process.returncode,
         'checks': ['production Docker app', 'artifact-driven browser journeys',
                    'text visible before CLI completion', 'monitor restart during active CLI',
                    'real CLI terminal result'],
     }, indent=2) + '\n')
+    run(['docker', 'stop', name])
+    review_export = evidence / 'review-cli'
+    review_export.mkdir(exist_ok=True)
+    review_continue = evidence / 'review-continue'
+    review_release = evidence / 'review-release'
+    review_done = evidence / 'review-done'
+    for marker in [review_continue, review_release, review_done, review_export / 'snapshot.json']:
+        marker.unlink(missing_ok=True)
+    review_environment = dict(os.environ, CRABBER_VERIFY_ARTIFACTS=str(review_export),
+        CRABBER_VERIFY_REVIEW_CONTINUE_FILE=str(review_continue),
+        CRABBER_VERIFY_REVIEW_RELEASE_FILE=str(review_release),
+        CRABBER_VERIFY_REVIEW_DONE_FILE=str(review_done), TMPDIR=str(scratch))
+    with (evidence / 'review-cli.txt').open('w') as output:
+        process = subprocess.Popen(['cargo', 'test', '--locked', '--test', 'cli',
+            'cli_review_recovery_browser_journey', '--', '--ignored', '--nocapture'],
+            cwd=ROOT, env=review_environment, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        wait_until(lambda: (review_export / 'snapshot.json').is_file() or process.poll() is not None,
+            'failed review checkpoint artifacts', timeout=180)
+        if process.poll() is not None:
+            raise RuntimeError('Review journey exited early. Read review-cli.txt.')
+        review_snapshot = json.loads((review_export / 'snapshot.json').read_text())
+        actual_review = Path(review_snapshot['artifacts'])
+        start_server(actual_review.parent, host_port, name)
+        browser(host_port, actual_review.parent, 'node /scripts/browser_review_recovery.mjs',
+            [f'LIVE_RUN_ID={review_snapshot["run_id"]}'])
+        if process.wait(timeout=45):
+            raise RuntimeError('Review recovery CLI journey failed. Read review-cli.txt.')
+    result = json.loads((evidence / 'result.json').read_text())
+    result['status'] = 'passed'
+    result['review_run_id'] = review_snapshot['run_id']
+    result['checks'].extend(['failed reviewer preserved', 'same workflow resumed',
+        'completed role reused', 'new generation live status', 'fresh approval after fixes'])
+    run(['docker', 'stop', name])
+    refresh_export = evidence / 'refresh-cli'
+    refresh_export.mkdir(exist_ok=True)
+    refresh_markers = [evidence / f'refresh-{stage}' for stage in ('continue', 'release', 'done')]
+    for marker in [*refresh_markers, refresh_export / 'snapshot.json', refresh_export / 'refresh.json']:
+        marker.unlink(missing_ok=True)
+    refresh_environment = dict(os.environ, CRABBER_VERIFY_ARTIFACTS=str(refresh_export),
+        CRABBER_VERIFY_REFRESH_CONTINUE_FILE=str(refresh_markers[0]),
+        CRABBER_VERIFY_REFRESH_RELEASE_FILE=str(refresh_markers[1]),
+        CRABBER_VERIFY_REFRESH_DONE_FILE=str(refresh_markers[2]), TMPDIR=str(scratch))
+    with (evidence / 'refresh-cli.txt').open('w') as output:
+        process = subprocess.Popen(['cargo', 'test', '--locked', '--test', 'cli',
+            'cli_review_refresh_browser_journey', '--', '--ignored', '--nocapture'],
+            cwd=ROOT, env=refresh_environment, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        wait_until(lambda: (refresh_export / 'snapshot.json').is_file() or process.poll() is not None,
+            'failed refresh-source artifacts', timeout=180)
+        if process.poll() is not None:
+            raise RuntimeError('Refresh journey exited early. Read refresh-cli.txt.')
+        refresh_snapshot = json.loads((refresh_export / 'snapshot.json').read_text())
+        start_server(Path(refresh_snapshot['artifacts']).parent, host_port, name)
+        browser(host_port, Path(refresh_snapshot['artifacts']).parent, 'node /scripts/browser_review_refresh.mjs',
+            [f'LIVE_RUN_ID={refresh_snapshot["run_id"]}', 'REFRESH_EXPORT_DIR=/evidence/refresh-cli'])
+        if process.wait(timeout=60):
+            raise RuntimeError('Review refresh CLI journey failed. Read refresh-cli.txt.')
+    result['refresh_source_run_id'] = refresh_snapshot['run_id']
+    result['checks'].extend(['failed source retained', 'linked child review at global round four',
+        'both refreshed reviewers fresh', 'child terminal approval', 'parent navigation retains failure'])
+    (evidence / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
 finally:
     release.touch()
     finished.touch()
+    for marker in ['review-continue', 'review-release', 'review-done',
+                   'refresh-continue', 'refresh-release', 'refresh-done']:
+        (evidence / marker).touch()
     subprocess.run(['docker', 'stop', name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if process is not None and process.poll() is None:
         try:
             process.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            process.terminate()
+            os.killpg(process.pid, signal.SIGTERM)
             process.wait(timeout=10)
 print(f'Verified. Evidence survives cleanup at {evidence}')
