@@ -170,6 +170,11 @@ impl Fixture {
                             } else {
                                 tool("file_write", json!({"path":"config.toml","content":"mode = \"initial\"\n"}))
                             }
+                        } else if serialized.contains("BATCHED_TOOLS") && !has_result {
+                            json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                                {"id":"batch-write","function":{"name":"file_write","arguments":json!({"path":"hello.txt","content":"initial\n"}).to_string()}},
+                                {"id":"batch-denied-read","function":{"name":"file_read","arguments":json!({"path":"../outside-batching"}).to_string()}}
+                            ]},"finish_reason":"tool_calls"}]})
                         } else if serialized.contains("COMPLETION_") {
                             let attempt = requests.fetch_add(1, Ordering::Relaxed);
                             if serialized.contains("COMPLETION_DUPLICATE_START") {
@@ -685,8 +690,11 @@ fn cli_streams_live_artifacts_before_completion() {
     assert!(!evidence["session_id"].as_str().unwrap().is_empty());
     let tool_log = std::fs::read_to_string(artifacts.join("implement.tools.txt")).unwrap();
     assert!(
-        !tool_log.trim().is_empty(),
-        "tool results must be visible during a session"
+        tool_log.lines().any(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["observation"]["event_kind"]
+                == "tool_call_settled"
+        }),
+        "settled tool results must be visible during a session"
     );
     for line in tool_log.lines() {
         serde_json::from_str::<Value>(line).unwrap();
@@ -844,7 +852,20 @@ fn explicit_turn_budget_fails_with_preserved_evidence() {
     let artifacts = run_artifacts(repo.path());
     assert!(artifacts.join("implement.txt").is_file());
     let tool_log = std::fs::read_to_string(artifacts.join("implement.tools.txt")).unwrap();
-    assert_eq!(tool_log.lines().count(), 3);
+    let rows = tool_log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["observation"]["event_kind"] == "tool_call_settled")
+            .count(),
+        3
+    );
+    assert!(rows.iter().any(
+        |row| row["observation"]["event_kind"] == "tool_call_pending"
+            && row["arguments"].is_object()
+    ));
 }
 
 #[test]

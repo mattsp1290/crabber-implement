@@ -72,4 +72,8 @@ For checkpoint, resume, reviewer identity or rendering changes, run [review reco
 
 For final reviewer prompts, snapshots, artifact tools, or input caps, run [bounded review inputs](features/bounded-review-inputs.md). For an upgraded executable, use the explicit refresh journey in [review recovery](features/review-recovery.md). Normal invocation, strict resume, and refresh have separate acceptance checks. Never run source mutations while a browser or strict-resume journey depends on an unchanged executable.
 
-For the Codex route and native review ownership, run [Codex subagents](features/codex-subagents.md). The local coordinator calls the native extension through a real parent Agent; each child records its parent session/run/call IDs. Strict resume and refresh accept only checkpoint version 3. All older provider records are rejected before model calls.
+For the Codex route, native review ownership, and model-side tool batching, run [Codex subagents](features/codex-subagents.md). Returned tools execute sequentially and retain their original result and error order. The local coordinator calls the native extension through a real parent Agent; each child records its parent session/run/call IDs. Strict resume and refresh accept only checkpoint version 3. All older provider records are rejected before model calls.
+
+Mutable implementation and fix sessions receive guidance to set finite framework-level test timeouts shorter than the outer shell deadline. A timeout remains a test failure to diagnose. Read-only review sessions do not receive this guidance. This is prompt guidance, not an enforced timeout policy. See [Codex subagents](features/codex-subagents.md) for exact checks.
+
+For prepared tool inputs and pending and settled event provenance, run [tool invocation evidence](features/tool-invocation-evidence.md). Verify durable replay and exported artifacts after the fixture cleans up.

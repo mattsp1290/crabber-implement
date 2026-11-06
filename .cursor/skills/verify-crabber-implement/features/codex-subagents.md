@@ -17,3 +17,19 @@ The unit checks exercise deterministic repeated dispatch, rejection of mismatche
 Checkpoint schema 3 binds the Codex profile, Responses protocol, model, effort, endpoint and input identity. Version 1 and version 2 records are refused for both resume and refresh. The model and effort can be selected explicitly, but all work uses the native Codex route.
 
 After the fixture's disposable repository is gone, inspect the captured command logs and any copied workflow/checkpoint evidence. Never rebuild or mutate production files during a two-process resume journey because the executable digest is part of checkpoint identity.
+
+## Model-side tool batching
+
+Require every real host Responses request to set `parallel_tool_calls: true`. This allows the model to return multiple tool calls in one response. The runtime executes those calls sequentially.
+
+```sh
+cargo test --locked --test cli responses::batched_tool_calls_replay_both_results_and_preserve_errors_in_call_order -- --nocapture
+```
+
+The fixture interleaves arguments and completes calls in reverse stream order. Require the successful write and denied path escape to replay in original call order. Inspect exact call IDs, argument payloads, write output, and the `path_escape` error. This deterministic CLI journey uses the actual executable and a loopback Responses endpoint.
+
+## Mutable-session test timeout guidance
+
+Inspect `src/agent.rs` where `build_agent_with_resolver` creates the system prompt. Require finite framework-level test timeout guidance only when `readonly` is false. The guidance asks for a deadline shorter than the outer shell timeout and sized for the suite and repeat count. It treats timeouts as failures, preserves diagnostics, and asks the agent to diagnose before retrying without skipping tests or blindly increasing deadlines.
+
+This is prompt guidance. The host does not enforce a framework timeout or prove the model follows it. Read-only reviewers retain their existing prompt. Real-workflow evidence must independently verify preserved assertions, completed tests, both distinct final reviewers, and the shared acceptance checks. A candidate that completes where its baseline times out provides within-budget completion evidence, not a successful-pair speedup.

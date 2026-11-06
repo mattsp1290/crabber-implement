@@ -314,8 +314,26 @@ impl StageSession<'_> {
                     .write_all(delta.as_bytes())
                     .context("write session transcript")?;
             }
-            EventKind::ToolCallSettled => {
-                writeln!(tool_log, "{}", event.payload).context("write session tool log")?
+            EventKind::ToolCallPending | EventKind::ToolCallSettled => {
+                let mut payload = event
+                    .payload
+                    .as_object()
+                    .context("tool observation payload must be an object")?
+                    .clone();
+                anyhow::ensure!(
+                    !payload.contains_key("observation"),
+                    "tool observation payload already contains observation"
+                );
+                payload.insert(
+                    "observation".into(),
+                    serde_json::json!({
+                        "session_id": event.session_id,
+                        "run_id": event.run_id,
+                        "event_kind": event.kind,
+                    }),
+                );
+                writeln!(tool_log, "{}", serde_json::Value::Object(payload))
+                    .context("write session tool log")?
             }
             EventKind::ModelResponseCompleted => {
                 let attempt = self.runs.last_mut().unwrap();
@@ -698,8 +716,13 @@ fn build_agent_with_resolver(
     agent_config.max_output_tokens = None;
     agent_config.model_controls.reasoning_effort = Some(config.reasoning_effort);
     agent_config.system_prompt = Some(format!(
-        "You are a coding agent working in {}. Follow applicable AGENTS.md instructions. Complete the assigned task using the available tools. Never push, deploy, contact others, change branches, commit, or modify Git metadata. The host owns commits. Do not read credentials. Shell commands run locally with the user's access and are not sandboxed. Report uncertainty and failures honestly. Stop rather than claiming success when blocked.",
-        config.repo.display()
+        "You are a coding agent working in {}. Follow applicable AGENTS.md instructions. Complete the assigned task using the available tools. Never push, deploy, contact others, change branches, commit, or modify Git metadata. The host owns commits. Do not read credentials. Shell commands run locally with the user's access and are not sandboxed.{} Report uncertainty and failures honestly. Stop rather than claiming success when blocked.",
+        config.repo.display(),
+        if readonly {
+            ""
+        } else {
+            " Before running tests, set a finite framework-level timeout shorter than the outer shell timeout and sized for the suite and repeat count, such as `go test -timeout=60s ./...`. A timeout is a test failure; preserve its diagnostics and diagnose the cause before retrying, without skipping tests or blindly increasing deadlines."
+        }
     ));
     let standard_names = tools
         .definitions()
@@ -756,18 +779,74 @@ mod tests {
 
     #[tokio::test]
     async fn lagged_live_observation_has_committed_answer_and_durable_completion() {
+        use crabber::EventKind;
         use crabber::session::Store;
         let store = std::sync::Arc::new(crabber::session::MemoryStore::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        struct ShellFixture(std::sync::Arc<tokio::sync::Notify>);
+        #[async_trait::async_trait]
+        impl crabber::JsonToolExecutor for ShellFixture {
+            async fn execute(
+                &self,
+                input: serde_json::Value,
+            ) -> Result<serde_json::Value, crabber::ExtensionError> {
+                if input["command"] == "first" {
+                    self.0.notified().await;
+                }
+                Ok(
+                    serde_json::json!({"exit_code": if input["command"] == "second" { 2 } else { 0 }, "stdout": input["command"]}),
+                )
+            }
+        }
+        let calls = [
+            crabber::core::ToolCallId::new(),
+            crabber::core::ToolCallId::new(),
+        ];
+        let mut tool_deltas = Vec::new();
+        for (id, command) in calls.iter().zip(["first", "second"]) {
+            tool_deltas.extend([
+                crabber::StreamDelta::ToolCallStart {
+                    call_id: id.clone(),
+                    name: "shell".into(),
+                },
+                crabber::StreamDelta::ToolCallArgsDelta {
+                    call_id: id.clone(),
+                    text: serde_json::json!({"command":command}).to_string(),
+                },
+                crabber::StreamDelta::ToolCallDone {
+                    call_id: id.clone(),
+                },
+            ]);
+        }
+        tool_deltas.push(crabber::StreamDelta::Completed);
         let mut deltas = (0..600)
             .map(|_| crabber::StreamDelta::TextDelta("x".into()))
             .collect::<Vec<_>>();
         deltas.push(crabber::StreamDelta::Completed);
         let agent = crabber::Agent::builder()
             .behavior_version("lag-regression.v1")
+            .policy(std::sync::Arc::new(crabber::StaticPolicy::new(
+                crabber::PermissionDecision::Allow,
+            )))
             .store(store.clone())
             .provider(std::sync::Arc::new(crabber::FakeProvider::scripted(vec![
+                tool_deltas,
                 deltas,
+                vec![
+                    crabber::StreamDelta::TextDelta("continued".into()),
+                    crabber::StreamDelta::Completed,
+                ],
             ])))
+            .shared_tool(std::sync::Arc::new(crabber::ToolDefinition {
+                info: crabber::core::ToolInfo {
+                    name: "shell".into(),
+                    description: "fixture".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                    retry_safe: true,
+                    required_permissions: vec![],
+                },
+                executor: std::sync::Arc::new(ShellFixture(release.clone())),
+            }))
             .config(crabber::AgentConfig::new(crabber::Selection {
                 provider_id: "fake".into(),
                 model_id: "fixture".into(),
@@ -778,6 +857,13 @@ mod tests {
         let session = run.session_id().clone();
         let run_id = run.run_id().clone();
         let mut events = run.events();
+        let pending = loop {
+            let event = events.recv().await.unwrap().unwrap();
+            if event.kind == crabber::EventKind::ToolCallPending {
+                break event;
+            }
+        };
+        release.notify_one();
         run.done().await.unwrap();
         assert!(matches!(
             events.recv().await,
@@ -795,14 +881,14 @@ mod tests {
                 .iter()
                 .filter(|event| event.kind == crabber::EventKind::TurnStarted)
                 .count(),
-            1
+            2
         );
         assert_eq!(
             durable
                 .iter()
                 .filter(|event| event.kind == crabber::EventKind::ModelResponseCompleted)
                 .count(),
-            1
+            2
         );
         use std::io::{Seek, Write};
         let (_temp, config) = crate::review_checkpoint::tests::fixture();
@@ -849,6 +935,22 @@ mod tests {
             metadata: artifacts.metadata,
         };
         let mut text = String::new();
+        stage
+            .observe_event(
+                &pending,
+                &mut text,
+                &mut artifacts.transcript,
+                &mut artifacts.tools,
+                &mut artifacts.responses,
+            )
+            .unwrap();
+        let lagged_bytes = std::fs::read(config.artifacts.join("lagged.tools.txt")).unwrap();
+        assert!(String::from_utf8_lossy(&lagged_bytes).contains("tool_call_pending"));
+        artifacts.tools.set_len(tool_offset).unwrap();
+        artifacts
+            .tools
+            .seek(std::io::SeekFrom::Start(tool_offset))
+            .unwrap();
         for event in &durable {
             stage
                 .observe_event(
@@ -860,7 +962,96 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert_eq!(stage.observed_turns, 8);
+        assert_eq!(stage.observed_turns, 9);
+        let expected = std::fs::read(config.artifacts.join("lagged.tools.txt")).unwrap();
+        let rows = String::from_utf8(expected.clone())
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 4);
+        for id in &calls {
+            let pair = rows
+                .iter()
+                .filter(|row| row["call_id"] == id.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(pair.len(), 2);
+            assert_eq!(pair[0]["observation"]["event_kind"], "tool_call_pending");
+            assert_eq!(pair[1]["observation"]["event_kind"], "tool_call_settled");
+            assert_eq!(
+                pair[0]["observation"]["session_id"],
+                pair[1]["observation"]["session_id"]
+            );
+            assert_eq!(
+                pair[0]["observation"]["run_id"],
+                pair[1]["observation"]["run_id"]
+            );
+        }
+        let mut reversed = durable
+            .iter()
+            .filter(|event| event.kind == EventKind::ToolCallPending)
+            .cloned()
+            .collect::<Vec<_>>();
+        reversed.extend(
+            durable
+                .iter()
+                .rev()
+                .filter(|event| event.kind == EventKind::ToolCallSettled)
+                .cloned(),
+        );
+        for (index, status) in ["completed", "failed", "interrupted"].iter().enumerate() {
+            let mut event = reversed.last().unwrap().clone();
+            event.payload["status"] = serde_json::json!(status);
+            event.payload["is_error"] = serde_json::json!(index != 0);
+            event.payload["extra"] = serde_json::json!({"exit_code":2,"untouched":[1,"value"]});
+            reversed.push(event);
+        }
+        for event in &reversed {
+            let offset = artifacts.tools.stream_position().unwrap();
+            stage
+                .observe_event(
+                    event,
+                    &mut text,
+                    &mut artifacts.transcript,
+                    &mut artifacts.tools,
+                    &mut artifacts.responses,
+                )
+                .unwrap();
+            let bytes = std::fs::read(config.artifacts.join("lagged.tools.txt")).unwrap();
+            let mut projected: serde_json::Value =
+                serde_json::from_slice(&bytes[usize::try_from(offset).unwrap()..]).unwrap();
+            assert_eq!(
+                projected["observation"]["session_id"],
+                serde_json::json!(event.session_id)
+            );
+            assert_eq!(
+                projected["observation"]["run_id"],
+                serde_json::json!(event.run_id)
+            );
+            projected.as_object_mut().unwrap().remove("observation");
+            assert_eq!(projected, event.payload);
+        }
+        for payload in [
+            serde_json::json!(null),
+            serde_json::json!({"observation":"SDK owned"}),
+        ] {
+            let mut invalid = reversed[0].clone();
+            invalid.payload = payload;
+            let offset = artifacts.tools.stream_position().unwrap();
+            assert!(
+                stage
+                    .observe_event(
+                        &invalid,
+                        &mut text,
+                        &mut artifacts.transcript,
+                        &mut artifacts.tools,
+                        &mut artifacts.responses
+                    )
+                    .is_err()
+            );
+            assert_eq!(artifacts.tools.stream_position().unwrap(), offset);
+        }
         for _ in 0..2 {
             assert_eq!(
                 stage
@@ -875,22 +1066,47 @@ mod tests {
                     .unwrap(),
                 "x".repeat(600)
             );
-            assert_eq!(stage.observed_turns, 8);
+            assert_eq!(stage.observed_turns, 9);
             assert_eq!(stage.runs[0].observed_turns, 7);
-            assert_eq!(stage.runs[1].observed_turns, 1);
-            assert_eq!(stage.runs[1].response_count, 1);
+            assert_eq!(stage.runs[1].observed_turns, 2);
+            assert_eq!(stage.runs[1].response_count, 2);
             assert_eq!(
                 std::fs::read_to_string(config.artifacts.join("lagged.responses.jsonl"))
                     .unwrap()
                     .lines()
                     .count(),
-                2
+                3
             );
             assert_eq!(
-                std::fs::read_to_string(config.artifacts.join("lagged.tools.txt")).unwrap(),
-                "prior tool\n"
+                std::fs::read(config.artifacts.join("lagged.tools.txt")).unwrap(),
+                expected
             );
         }
+        let previous = std::fs::read(config.artifacts.join("lagged.tools.txt")).unwrap();
+        let next = agent
+            .prompt(stage.session_id.clone(), "continue")
+            .await
+            .unwrap();
+        let next_run = next.run_id().clone();
+        next.done().await.unwrap();
+        let next_offset = artifacts.tools.stream_position().unwrap();
+        let next_response_offset = artifacts.responses.stream_position().unwrap();
+        stage.run_id = Some(next_run.clone());
+        stage.runs.push(attempt(next_run, 0));
+        stage
+            .reconcile_observation(
+                &mut artifacts.transcript,
+                &mut artifacts.tools,
+                &mut artifacts.responses,
+                next_offset,
+                next_response_offset,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(config.artifacts.join("lagged.tools.txt")).unwrap(),
+            previous
+        );
         assert!(
             agent
                 .close(std::time::Duration::from_secs(1))
